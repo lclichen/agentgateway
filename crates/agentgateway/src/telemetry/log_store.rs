@@ -136,6 +136,24 @@ pub async fn search_sessions(request: SessionsRequest) -> anyhow::Result<Session
 		.await
 }
 
+pub async fn feedback_upsert(
+	request: FeedbackUpsertRequest,
+) -> anyhow::Result<FeedbackUpsertResponse> {
+	let store = REQUEST_LOG_STORE
+		.get()
+		.ok_or_else(|| anyhow::anyhow!("request log database is not configured"))?;
+	store
+		.request(|tx| LogStoreMsg::FeedbackUpsert { request, tx })
+		.await
+}
+
+pub async fn feedback_export() -> anyhow::Result<Vec<FeedbackEntry>> {
+	let store = REQUEST_LOG_STORE
+		.get()
+		.ok_or_else(|| anyhow::anyhow!("request log database is not configured"))?;
+	store.request(|tx| LogStoreMsg::FeedbackExport { tx }).await
+}
+
 pub struct RequestLogStoreGuard {
 	tx: Sender<LogStoreMsg>,
 	writer: Option<thread::JoinHandle<()>>,
@@ -190,6 +208,13 @@ enum LogStoreMsg {
 	SearchSessions {
 		request: SessionsRequest,
 		tx: QueryResponse<SessionsResponse>,
+	},
+	FeedbackUpsert {
+		request: FeedbackUpsertRequest,
+		tx: QueryResponse<FeedbackUpsertResponse>,
+	},
+	FeedbackExport {
+		tx: QueryResponse<Vec<FeedbackEntry>>,
 	},
 	Shutdown,
 }
@@ -369,6 +394,16 @@ async fn process_log_store_msg(
 			let _ = tx.send(backend.search_sessions(request).await);
 			false
 		},
+		LogStoreMsg::FeedbackUpsert { request, tx } => {
+			flush_log_store_batch(backend, batch).await;
+			let _ = tx.send(backend.feedback_upsert(request).await);
+			false
+		},
+		LogStoreMsg::FeedbackExport { tx } => {
+			flush_log_store_batch(backend, batch).await;
+			let _ = tx.send(backend.feedback_export().await);
+			false
+		},
 		LogStoreMsg::Shutdown => true,
 	}
 }
@@ -467,6 +502,10 @@ pub struct SearchRequest {
 	pub filters: LogFilters,
 	#[serde(default)]
 	pub include_attributes: bool,
+	/// Surface the joined request/response payloads on each entry. The search query always
+	/// reads the payload table; this only controls whether payloads appear in the result.
+	#[serde(default)]
+	pub include_payload: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -539,6 +578,96 @@ pub struct SessionSummary {
 pub struct SessionsResponse {
 	pub sessions: Vec<SessionSummary>,
 	pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FeedbackValue {
+	Up,
+	Down,
+}
+
+impl FeedbackValue {
+	pub fn as_str(&self) -> &'static str {
+		match self {
+			Self::Up => "up",
+			Self::Down => "down",
+		}
+	}
+
+	pub fn parse(value: &str) -> anyhow::Result<Self> {
+		match value {
+			"up" => Ok(Self::Up),
+			"down" => Ok(Self::Down),
+			other => anyhow::bail!("unknown feedback value {other}"),
+		}
+	}
+}
+
+/// The API contract documents the snippet as a short preview; reject runaway values by
+/// truncating rather than failing the batch.
+pub(crate) fn truncate_snippet(snippet: Option<&str>) -> Option<String> {
+	snippet.map(|snippet| {
+		if snippet.chars().count() <= 2000 {
+			snippet.to_string()
+		} else {
+			snippet.chars().take(2000).collect()
+		}
+	})
+}
+
+// No deny_unknown_fields on the feedback input types: they model an inbound cross-project
+// contract (pi-web), so additive client fields must not break ingestion.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackItem {
+	pub session_id: String,
+	pub entry_id: String,
+	pub value: FeedbackValue,
+	#[serde(default)]
+	pub snippet: Option<String>,
+	/// Client-side creation time in epoch milliseconds.
+	#[serde(default)]
+	pub created_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackUpsertRequest {
+	/// Identity of the submitting user; supplied by the trusted frontend proxy.
+	#[serde(default)]
+	pub user: Option<String>,
+	#[serde(default)]
+	pub feedback: Vec<FeedbackItem>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackUpsertResponse {
+	/// Keys of successfully stored items, in `<sessionId>:<entryId>` form. Items missing from
+	/// this list stay in the client's retry outbox.
+	pub accepted: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackEntry {
+	pub session_id: String,
+	pub entry_id: String,
+	pub value: FeedbackValue,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub snippet: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub client_created_at: Option<i64>,
+	pub server_created_at: DateTime<Utc>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub username: Option<String>,
+	/// Model captured from the aligned request-log row, when one was found.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub model: Option<String>,
+	/// request_logs.id of the aligned LLM call, when one was found.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub log_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -880,6 +1009,23 @@ impl Backend {
 		match self {
 			Self::Sqlite(store) => store.search_sessions(request).await,
 			Self::Postgres(store) => store.search_sessions(request).await,
+		}
+	}
+
+	async fn feedback_upsert(
+		&self,
+		request: FeedbackUpsertRequest,
+	) -> anyhow::Result<FeedbackUpsertResponse> {
+		match self {
+			Self::Sqlite(store) => store.feedback_upsert(request).await,
+			Self::Postgres(store) => store.feedback_upsert(request).await,
+		}
+	}
+
+	async fn feedback_export(&self) -> anyhow::Result<Vec<FeedbackEntry>> {
+		match self {
+			Self::Sqlite(store) => store.feedback_export().await,
+			Self::Postgres(store) => store.feedback_export().await,
 		}
 	}
 }

@@ -102,6 +102,9 @@ pub fn router(
 		.route("/api/logs/get", post(get_log))
 		.route("/api/logs/tail", post(tail_logs))
 		.route("/api/logs/sessions", post(search_sessions))
+		.route("/api/logs/export", post(export_logs))
+		.route("/api/feedback", post(post_feedback))
+		.route("/api/feedback/export", get(export_feedback))
 		.route("/api/logs/analytics/summary", post(analytics_summary))
 		.route("/api/costs/models", get(cost_models))
 		.route("/api/costs/refresh-base", post(refresh_base_costs))
@@ -860,6 +863,188 @@ async fn search_sessions(
 		.await
 		.map(Json)
 		.map_err(ErrorResponse::Anyhow)
+}
+
+const MAX_FEEDBACK_BATCH: usize = 50;
+const MAX_FEEDBACK_KEY_LEN: usize = 512;
+
+async fn post_feedback(
+	Json(request): Json<crate::telemetry::log_store::FeedbackUpsertRequest>,
+) -> Result<Json<crate::telemetry::log_store::FeedbackUpsertResponse>, ErrorResponse> {
+	if request.feedback.len() > MAX_FEEDBACK_BATCH {
+		return Err(ErrorResponse::Status(
+			StatusCode::BAD_REQUEST,
+			format!(
+				"feedback batch of {} exceeds the maximum of {MAX_FEEDBACK_BATCH}",
+				request.feedback.len()
+			),
+		));
+	}
+	if let Some(user) = &request.user
+		&& user.len() > MAX_FEEDBACK_KEY_LEN
+	{
+		return Err(ErrorResponse::Status(
+			StatusCode::BAD_REQUEST,
+			"feedback user exceeds the maximum length".to_string(),
+		));
+	}
+	for item in &request.feedback {
+		if item.session_id.is_empty() || item.entry_id.is_empty() {
+			return Err(ErrorResponse::Status(
+				StatusCode::BAD_REQUEST,
+				"feedback sessionId and entryId must not be empty".to_string(),
+			));
+		}
+		if item.session_id.len() > MAX_FEEDBACK_KEY_LEN || item.entry_id.len() > MAX_FEEDBACK_KEY_LEN {
+			return Err(ErrorResponse::Status(
+				StatusCode::BAD_REQUEST,
+				"feedback sessionId/entryId exceed the maximum length".to_string(),
+			));
+		}
+		if let Some(created_at) = item.created_at
+			&& chrono::DateTime::from_timestamp_millis(created_at).is_none()
+		{
+			return Err(ErrorResponse::Status(
+				StatusCode::BAD_REQUEST,
+				"feedback createdAt is out of range".to_string(),
+			));
+		}
+	}
+	crate::telemetry::log_store::feedback_upsert(request)
+		.await
+		.map(Json)
+		.map_err(ErrorResponse::Anyhow)
+}
+
+/// Server-side export of the full request log as newline-delimited JSON, streamed one
+/// page at a time so arbitrarily large exports do not buffer in memory. Attributes are
+/// always included; payloads follow `includePayload` (default true). The first page is
+/// resolved eagerly so store failures surface as HTTP errors; a failure mid-stream emits
+/// a final `{"exportError": ...}` marker line so truncated exports are detectable.
+async fn export_logs(Json(request): Json<LogsExportRequest>) -> Result<Response, ErrorResponse> {
+	use axum::body::Body;
+
+	let filename = format!(
+		"agentgateway-logs-{}.jsonl",
+		Utc::now().format("%Y%m%dT%H%M%SZ")
+	);
+	fn export_request(
+		request: &LogsExportRequest,
+		cursor: Option<String>,
+	) -> crate::telemetry::log_store::SearchRequest {
+		crate::telemetry::log_store::SearchRequest {
+			limit: Some(500),
+			cursor,
+			time_range: request.time_range.clone(),
+			filters: request.filters.clone(),
+			include_attributes: true,
+			include_payload: request.include_payload,
+		}
+	}
+	fn serialize_page(response: &crate::telemetry::log_store::SearchResponse) -> String {
+		let mut buf = String::new();
+		for entry in &response.logs {
+			match serde_json::to_string(entry) {
+				Ok(line) => {
+					buf.push_str(&line);
+					buf.push('\n');
+				},
+				Err(err) => {
+					tracing::warn!(?err, "failed to serialize log entry for export");
+				},
+			}
+		}
+		buf
+	}
+
+	// Resolve the first page before committing to a 200 response.
+	let first = crate::telemetry::log_store::search(export_request(&request, request.cursor.clone()))
+		.await
+		.map_err(ErrorResponse::Anyhow)?;
+	let first_buf = serialize_page(&first);
+	let next_cursor = first.next_cursor;
+
+	let stream = futures::stream::unfold(
+		(first_buf, next_cursor, request),
+		|(mut buf, cursor, request)| async move {
+			if !buf.is_empty() {
+				// Flush the buffered page first; the next step performs the next query.
+				return Some((
+					Ok::<_, std::convert::Infallible>(bytes::Bytes::from(std::mem::take(&mut buf))),
+					(buf, cursor, request),
+				));
+			}
+			let cursor = cursor?;
+			match crate::telemetry::log_store::search(export_request(&request, Some(cursor))).await {
+				Ok(response) => {
+					let next_cursor = response.next_cursor.clone();
+					Some((
+						Ok(bytes::Bytes::from(serialize_page(&response))),
+						(String::new(), next_cursor, request),
+					))
+				},
+				Err(err) => {
+					tracing::warn!(?err, "log export query failed mid-stream");
+					Some((
+						Ok(bytes::Bytes::from(
+							"{\"exportError\":\"log export failed mid-stream\"}\n",
+						)),
+						(String::new(), None, request),
+					))
+				},
+			}
+		},
+	);
+	Response::builder()
+		.header("content-type", "application/x-ndjson")
+		.header(
+			"content-disposition",
+			format!("attachment; filename={filename}"),
+		)
+		.body(Body::from_stream(stream))
+		.map_err(|err| ErrorResponse::Anyhow(anyhow::anyhow!(err)))
+}
+
+#[derive(serde::Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LogsExportRequest {
+	#[serde(default)]
+	cursor: Option<String>,
+	#[serde(default)]
+	time_range: Option<crate::telemetry::log_store::TimeRange>,
+	#[serde(default)]
+	filters: crate::telemetry::log_store::LogFilters,
+	#[serde(default = "default_true")]
+	include_payload: bool,
+}
+
+fn default_true() -> bool {
+	true
+}
+
+async fn export_feedback() -> Result<Response, ErrorResponse> {
+	let entries = crate::telemetry::log_store::feedback_export()
+		.await
+		.map_err(ErrorResponse::Anyhow)?;
+	let mut buf = String::new();
+	for entry in &entries {
+		buf.push_str(
+			&serde_json::to_string(entry).map_err(|err| ErrorResponse::Anyhow(anyhow::anyhow!(err)))?,
+		);
+		buf.push('\n');
+	}
+	let filename = format!(
+		"agentgateway-feedback-{}.jsonl",
+		Utc::now().format("%Y%m%dT%H%M%SZ")
+	);
+	Response::builder()
+		.header("content-type", "application/x-ndjson")
+		.header(
+			"content-disposition",
+			format!("attachment; filename={filename}"),
+		)
+		.body(axum::body::Body::from(buf))
+		.map_err(|err| ErrorResponse::Anyhow(anyhow::anyhow!(err)))
 }
 
 async fn analytics_summary(

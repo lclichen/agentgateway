@@ -2074,6 +2074,7 @@ fn ui_matches(oidc_redirect_path: Option<Strng>) -> Vec<RouteMatch> {
 		PathMatch::PathPrefix("/api/config".into()),
 		PathMatch::PathPrefix("/api/cel".into()),
 		PathMatch::PathPrefix("/api/logs".into()),
+		PathMatch::PathPrefix("/api/feedback".into()),
 		PathMatch::PathPrefix("/api/costs".into()),
 		PathMatch::PathPrefix("/api/budgets".into()),
 	];

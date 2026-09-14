@@ -5,11 +5,12 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, query_builder};
 
 use super::{
 	AnalyticsGroup, AnalyticsSummaryRequest, AnalyticsSummaryResponse, AnalyticsTimeBucket,
+	FeedbackEntry, FeedbackItem, FeedbackUpsertRequest, FeedbackUpsertResponse, FeedbackValue,
 	GenAiEntry, GetRequest, GetResponse, GroupBy, GroupByField, LogEntry, LogFilters, PayloadEntry,
 	SearchRequest, SearchResponse, SessionSummary, SessionsRequest, SessionsResponse,
 	StoredRequestLog, StoredRequestLogPayload, TailRequest, TailResponse, TimeRange, TurnEntry,
 	UsageEntry, analytics_window, attr_filter_values, decode_cursor, encode_cursor, limit,
-	promoted_attribute_column, prompt_preview, turn_kind,
+	promoted_attribute_column, prompt_preview, truncate_snippet, turn_kind,
 };
 
 pub struct SqliteLogStore {
@@ -148,7 +149,7 @@ impl SqliteLogStore {
 		let rows = qb.build().fetch_all(&self.pool).await?;
 		let mut logs = rows
 			.into_iter()
-			.map(|row| row_to_log(row, request.include_attributes, false))
+			.map(|row| row_to_log(row, request.include_attributes, request.include_payload))
 			.collect::<Result<Vec<_>, _>>()?;
 		let next_cursor = if logs.len() > limit as usize {
 			let _ = logs.pop();
@@ -428,6 +429,103 @@ impl SqliteLogStore {
 			next_cursor,
 		})
 	}
+
+	pub async fn feedback_upsert(
+		&self,
+		request: FeedbackUpsertRequest,
+	) -> anyhow::Result<FeedbackUpsertResponse> {
+		let now = chrono::Utc::now();
+		let mut tx = self.pool.begin().await?;
+		let mut accepted = Vec::with_capacity(request.feedback.len());
+		for item in &request.feedback {
+			let (server_created_at, alignment) = self.align_feedback(&mut tx, item, now).await?;
+			sqlx::query(
+				r#"INSERT INTO message_feedback (
+					session_id, entry_id, value, snippet, client_created_at, server_created_at,
+					username, model, log_id
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+				ON CONFLICT(session_id, entry_id) DO UPDATE SET
+					value = excluded.value,
+					snippet = excluded.snippet,
+					client_created_at = excluded.client_created_at,
+					server_created_at = excluded.server_created_at,
+					username = excluded.username,
+					model = excluded.model,
+					log_id = excluded.log_id
+				"#,
+			)
+			.bind(&item.session_id)
+			.bind(&item.entry_id)
+			.bind(item.value.as_str())
+			.bind(truncate_snippet(item.snippet.as_deref()))
+			.bind(item.created_at)
+			.bind(server_created_at)
+			.bind(request.user.as_deref())
+			.bind(alignment.as_ref().and_then(|(_, model)| model.clone()))
+			.bind(alignment.as_ref().map(|(log_id, _)| log_id.clone()))
+			.execute(&mut *tx)
+			.await?;
+			accepted.push(format!("{}:{}", item.session_id, item.entry_id));
+		}
+		tx.commit().await?;
+		Ok(FeedbackUpsertResponse { accepted })
+	}
+
+	/// Best-effort alignment of a feedback item to the LLM call it refers to: the latest
+	/// logged request in the same session at or before the feedback timestamp. entryId is a
+	/// client-side session-file concept the gateway never sees, so this is a heuristic.
+	/// Runs on the caller's transaction connection: the pool may be a single connection.
+	async fn align_feedback(
+		&self,
+		conn: &mut sqlx::SqliteConnection,
+		item: &FeedbackItem,
+		now: chrono::DateTime<chrono::Utc>,
+	) -> anyhow::Result<(
+		chrono::DateTime<chrono::Utc>,
+		Option<(String, Option<String>)>,
+	)> {
+		let created_at = item
+			.created_at
+			.and_then(chrono::DateTime::from_timestamp_millis)
+			.unwrap_or(now);
+		let aligned: Option<(String, Option<String>)> = sqlx::query_as(
+			"SELECT id, gen_ai_request_model FROM request_logs \
+			 WHERE agentgateway_session = ? AND completed_at <= ? \
+			 ORDER BY completed_at DESC, id DESC LIMIT 1",
+		)
+		.bind(&item.session_id)
+		.bind(created_at)
+		.fetch_optional(conn)
+		.await?;
+		Ok((now, aligned))
+	}
+
+	pub async fn feedback_export(&self) -> anyhow::Result<Vec<FeedbackEntry>> {
+		let rows = sqlx::query(
+			"SELECT session_id, entry_id, value, snippet, client_created_at, server_created_at, \
+			 username, model, log_id \
+			 FROM message_feedback ORDER BY server_created_at ASC, session_id ASC, entry_id ASC",
+		)
+		.fetch_all(&self.pool)
+		.await?;
+		rows
+			.into_iter()
+			.map(|row| {
+				let value: String = row.try_get("value")?;
+				Ok(FeedbackEntry {
+					session_id: row.try_get("session_id")?,
+					entry_id: row.try_get("entry_id")?,
+					value: FeedbackValue::parse(&value)?,
+					snippet: row.try_get("snippet")?,
+					client_created_at: row.try_get("client_created_at")?,
+					server_created_at: row.try_get("server_created_at")?,
+					username: row.try_get("username")?,
+					model: row.try_get("model")?,
+					log_id: row.try_get("log_id")?,
+				})
+			})
+			.collect()
+	}
 }
 
 fn groups_from_buckets(buckets: &[AnalyticsTimeBucket]) -> Vec<AnalyticsGroup> {
@@ -621,7 +719,7 @@ fn row_to_log(
 		input: turn_kind(request_prompt.as_ref().map(|value| &value.0)),
 		output: turn_kind(response_completion.as_ref().map(|value| &value.0)),
 	};
-	let payload = if include_payload {
+	let payload = if include_payload && (request_prompt.is_some() || response_completion.is_some()) {
 		Some(PayloadEntry {
 			request_prompt: request_prompt.map(|v| v.0),
 			response_completion: response_completion.map(|v| v.0),
@@ -734,6 +832,22 @@ CREATE TABLE IF NOT EXISTS request_log_payloads (
 	request_prompt_json TEXT,
 	response_completion_json TEXT
 );
+
+CREATE TABLE IF NOT EXISTS message_feedback (
+	session_id TEXT NOT NULL,
+	entry_id TEXT NOT NULL,
+	value TEXT NOT NULL,
+	snippet TEXT,
+	client_created_at INTEGER,
+	server_created_at TEXT NOT NULL,
+	username TEXT,
+	model TEXT,
+	log_id TEXT,
+	PRIMARY KEY (session_id, entry_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_feedback_server_created_at ON message_feedback(server_created_at);
+CREATE INDEX IF NOT EXISTS idx_message_feedback_session ON message_feedback(session_id);
 
 CREATE INDEX IF NOT EXISTS idx_request_logs_completed_at ON request_logs(completed_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_request_logs_usage_completed_at ON request_logs(completed_at DESC, total_tokens, cost);
@@ -896,6 +1010,7 @@ mod tests {
 				time_range: None,
 				filters: LogFilters::default(),
 				include_attributes: false,
+				include_payload: false,
 			})
 			.await
 			.unwrap();
@@ -1010,6 +1125,7 @@ mod tests {
 				time_range: None,
 				filters: LogFilters::default(),
 				include_attributes: false,
+				include_payload: false,
 			})
 			.await
 			.unwrap();
@@ -1019,5 +1135,110 @@ mod tests {
 			.find(|log| log.id == "legacy")
 			.expect("legacy row");
 		assert_eq!(legacy.session, None);
+	}
+}
+
+#[cfg(test)]
+mod feedback_tests {
+	use super::tests::{memory_pool, sample};
+	use super::*;
+	use crate::telemetry::log_store::FeedbackUpsertRequest;
+	use chrono::{TimeZone, Utc};
+
+	fn item(session: &str, entry: &str, value: FeedbackValue, created_at: i64) -> FeedbackItem {
+		FeedbackItem {
+			session_id: session.to_string(),
+			entry_id: entry.to_string(),
+			value,
+			snippet: Some("short preview".to_string()),
+			created_at: Some(created_at),
+		}
+	}
+
+	#[tokio::test]
+	async fn feedback_upsert_is_idempotent_and_aligned() {
+		let store = SqliteLogStore::from_pool(memory_pool().await)
+			.await
+			.unwrap();
+		let base = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+		// Two LLM calls inside the session; feedback refers to the first one.
+		store
+			.insert_batch(&[
+				sample(
+					"0001",
+					Some("session-a"),
+					base,
+					Some(StoredRequestLogPayload {
+						request_prompt_json: Some(serde_json::json!([
+							{"role": "user", "parts": [{"type": "text", "text": "first"}]}
+						])),
+						response_completion_json: None,
+					}),
+				),
+				sample(
+					"0002",
+					Some("session-a"),
+					base + chrono::Duration::seconds(60),
+					None,
+				),
+			])
+			.await
+			.unwrap();
+
+		let feedback_created_at = base.timestamp_millis() + 30_000; // between the two calls
+		let response = store
+			.feedback_upsert(FeedbackUpsertRequest {
+				user: Some("alice".to_string()),
+				feedback: vec![item(
+					"session-a",
+					"entry-1",
+					FeedbackValue::Up,
+					feedback_created_at,
+				)],
+			})
+			.await
+			.unwrap();
+		assert_eq!(response.accepted, vec!["session-a:entry-1".to_string()]);
+
+		// Same entry re-submitted with the opposite value: upsert overwrites, still one row.
+		let response = store
+			.feedback_upsert(FeedbackUpsertRequest {
+				user: Some("alice".to_string()),
+				feedback: vec![item(
+					"session-a",
+					"entry-1",
+					FeedbackValue::Down,
+					feedback_created_at + 1_000,
+				)],
+			})
+			.await
+			.unwrap();
+		assert_eq!(response.accepted, vec!["session-a:entry-1".to_string()]);
+
+		let entries = store.feedback_export().await.unwrap();
+		assert_eq!(entries.len(), 1);
+		let entry = &entries[0];
+		assert_eq!(entry.value, FeedbackValue::Down);
+		assert_eq!(entry.username.as_deref(), Some("alice"));
+		// Aligned to the latest call at or before the feedback timestamp (0001, not 0002).
+		assert_eq!(entry.log_id.as_deref(), Some("0001"));
+		assert_eq!(entry.model.as_deref(), Some("test-model"));
+
+		// Unknown sessions still store (alignment is best-effort).
+		store
+			.feedback_upsert(FeedbackUpsertRequest {
+				user: None,
+				feedback: vec![item("ghost-session", "entry-9", FeedbackValue::Up, 0)],
+			})
+			.await
+			.unwrap();
+		let entries = store.feedback_export().await.unwrap();
+		assert_eq!(entries.len(), 2);
+		let ghost = entries
+			.iter()
+			.find(|e| e.session_id == "ghost-session")
+			.unwrap();
+		assert_eq!(ghost.log_id, None);
+		assert_eq!(ghost.model, None);
 	}
 }

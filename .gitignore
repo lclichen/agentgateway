@@ -40,3 +40,8 @@ cfg.yaml
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# local smoke-test artifacts
+/agw-ui-test.db*
+/gateway-run.log
+/ui-test-config.yaml
