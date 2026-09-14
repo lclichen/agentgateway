@@ -1735,6 +1735,8 @@ impl ModelRoute {
 						authorization,
 					},
 					backend_policies: vec![],
+					// Model metadata is only configurable in standalone configs today.
+					metadata: None,
 				})
 			},
 			Some(model_route::Kind::VirtualModel(virtual_model)) => {
@@ -1805,6 +1807,8 @@ impl ModelRoute {
 					created: s.created,
 					llm_policy,
 					routing,
+					// Model metadata is only configurable in standalone configs today.
+					metadata: None,
 				})
 			},
 			None => {
