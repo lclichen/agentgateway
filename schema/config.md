@@ -87,7 +87,7 @@
 |`config.standardAttributes`|object|Standard request log attributes populated for database-backed local runtime features.|
 |`config.standardAttributes.user`|string|CEL expression used to populate the `agentgateway.user` request log attribute.|
 |`config.standardAttributes.group`|string|CEL expression used to populate the `agentgateway.group` request log attribute.|
-|`config.standardAttributes.session`|string|CEL expression identifying the session a request belongs to, exposed to CEL as `request.agent.session`.<br>If unset, or if the expression fails, the session is detected from well-known agent headers<br>such as `x-claude-code-session-id`. Return `null` to mark the request as having no session.|
+|`config.standardAttributes.session`|string|CEL expression used to populate the `agentgateway.session` request log attribute.<br>Sessions are stored in a dedicated indexed column and power the UI conversation view.|
 |`config.statsAddr`|string|Stats/metrics server address in the format "ip:port", "localhost:port", "unix:/path/to/socket", or "off"|
 |`config.histograms`|enum|Histogram representation to collect. Native histograms are exposed only through the<br>Prometheus protobuf format. Defaults to classic.<br>Possible values: `classic`, `native`, `both`.|
 |`config.readinessAddr`|string|Readiness probe server address in the format "ip:port", "localhost:port", "unix:/path/to/socket", or "off"|
@@ -5811,6 +5811,11 @@
 |`llm.models[].provider.custom.formats`|[]object|Supported API payload formats and optional path overrides for this provider.|
 |`llm.models[].provider.custom.formats[].type`|enum|Upstream API shape this custom provider says it accepts.<br>Possible values: `completions`, `messages`, `responses`, `embeddings`, `anthropicTokenCount`, `generateContent`, `geminiCountTokens`, `realtime`, `rerank`, `decisions`, `systemOne`.|
 |`llm.models[].provider.custom.formats[].path`|string|Optional path override for this specific upstream format.|
+|`llm.models[].metadata`|object|metadata advertises static model capabilities/limits through the model list API.|
+|`llm.models[].metadata.contextLength`|integer|Maximum total context length (prompt + completion tokens) the model accepts.|
+|`llm.models[].metadata.maxOutputTokens`|integer|Maximum completion (output) tokens per request.|
+|`llm.models[].metadata.inputModalities`|[]string|Input modalities the model accepts, e.g. ["text", "image"].|
+|`llm.models[].metadata.outputModalities`|[]string|Output modalities the model produces, e.g. ["text"].|
 |`llm.models[].passthrough`|enum|passthrough controls how requests are handled.<br>By default, requests will be parsed and translated as needed.<br>With passthrough, they will be unmodified and optionally inspected (with `detect`).<br>In this mode, requests must be sent in the native format of the provider.<br>Possible values: `detect`, `opaque`.|
 |`llm.models[].authorization`|object|authorization configures HTTP authorization rules for requests to this model.|
 |`llm.models[].authorization.rules`|[]object|CEL authorization rules to evaluate for a request.|
@@ -5921,6 +5926,11 @@
 |`llm.virtualModels[].routing.callout.cache.key`|[]string|CEL expressions that make up the cache key. Empty keys are accepted, but do not produce cache hits.|
 |`llm.virtualModels[].routing.callout.cache.ttl`|string|CEL expression that returns how long cached results are reused.<br>Must return either a duration or timestamp.|
 |`llm.virtualModels[].routing.callout.cache.maxEntries`|integer|Maximum number of results to keep in the cache.|
+|`llm.virtualModels[].metadata`|object|metadata advertises static model capabilities/limits through the model list API.|
+|`llm.virtualModels[].metadata.contextLength`|integer|Maximum total context length (prompt + completion tokens) the model accepts.|
+|`llm.virtualModels[].metadata.maxOutputTokens`|integer|Maximum completion (output) tokens per request.|
+|`llm.virtualModels[].metadata.inputModalities`|[]string|Input modalities the model accepts, e.g. ["text", "image"].|
+|`llm.virtualModels[].metadata.outputModalities`|[]string|Output modalities the model produces, e.g. ["text"].|
 |`llm.policies`|object|policies defines policies for handling incoming requests, before a model is selected|
 |`llm.policies.oidc`|object|Authenticate browser requests with OIDC authorization code flow.|
 |`llm.policies.oidc.issuer`|string|Issuer used for discovery and ID token validation.|

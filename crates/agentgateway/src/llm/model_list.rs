@@ -20,6 +20,25 @@ pub struct ModelInfo {
 	pub modalities: Modalities,
 	pub capabilities: Capabilities,
 	pub reasoning: Reasoning,
+	/// Config-declared static metadata (`llm.models[].metadata`); when set these values
+	/// are served on the entry even when the catalog knows nothing about the model, and
+	/// context_length overrides the catalog limit.
+	pub declared: DeclaredMetadata,
+}
+
+/// Static capability/limit metadata declared in config, served as extra fields on model
+/// list entries so clients can render context windows and modalities without hard-coding
+/// them. All fields are optional; omitted fields are omitted from the API.
+#[derive(Clone, Debug, Default, PartialEq, ::serde::Serialize)]
+pub struct DeclaredMetadata {
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub context_length: Option<i64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub max_output_tokens: Option<i64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub input_modalities: Option<Vec<String>>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub output_modalities: Option<Vec<String>>,
 }
 
 impl ModelInfo {
@@ -45,6 +64,7 @@ impl ModelInfo {
 			modalities: m.modalities.clone(),
 			capabilities: m.capabilities.clone(),
 			reasoning: m.reasoning.clone(),
+			..Default::default()
 		}
 	}
 
@@ -116,6 +136,7 @@ impl ModelInfo {
 				effort: shared(|t| &t.reasoning.effort),
 				..Default::default()
 			},
+			..Default::default()
 		}
 	}
 }
@@ -166,6 +187,12 @@ struct Entry<'a> {
 	max_input_tokens: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	max_tokens: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	max_output_tokens: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	input_modalities: Option<Vec<&'a str>>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	output_modalities: Option<Vec<&'a str>>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	architecture: Option<Architecture<'a>>,
 	#[serde(skip_serializing_if = "EntryCapabilities::is_empty")]
@@ -230,16 +257,34 @@ impl<'a> Entry<'a> {
 			params.push("temperature");
 		}
 		params.sort();
+		let declared_context = m
+			.declared
+			.context_length
+			.and_then(|value| u64::try_from(value).ok());
 		Self {
 			id: &m.id,
 			object: "model",
 			created: m.created,
 			owned_by: m.provider.as_deref().unwrap_or("openai"),
 			name: m.name.as_deref(),
-			context_window: m.limits.context,
-			context_length: m.limits.context,
+			context_window: declared_context.or(m.limits.context),
+			context_length: declared_context.or(m.limits.context),
 			max_input_tokens: m.limits.input.or(m.limits.context),
 			max_tokens: m.limits.output,
+			max_output_tokens: m
+				.declared
+				.max_output_tokens
+				.and_then(|value| u64::try_from(value).ok()),
+			input_modalities: m
+				.declared
+				.input_modalities
+				.as_ref()
+				.map(|list| list.iter().map(String::as_str).collect()),
+			output_modalities: m
+				.declared
+				.output_modalities
+				.as_ref()
+				.map(|list| list.iter().map(String::as_str).collect()),
 			architecture: (!m.modalities.input.is_empty() || !m.modalities.output.is_empty()).then(
 				|| Architecture {
 					input_modalities: modalities(&m.modalities.input),
