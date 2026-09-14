@@ -10,9 +10,10 @@ use tracing::{error, info, warn};
 use super::{
 	AnalyticsGroup, AnalyticsSummaryRequest, AnalyticsSummaryResponse, AnalyticsTimeBucket,
 	GenAiEntry, GetRequest, GetResponse, GroupBy, GroupByField, LogEntry, LogFilters, PayloadEntry,
-	SearchRequest, SearchResponse, StoredRequestLog, StoredRequestLogPayload, TailRequest,
-	TailResponse, TimeRange, TurnEntry, UsageEntry, analytics_window, attr_filter_values,
-	decode_cursor, encode_cursor, limit, promoted_attribute_column, prompt_preview, turn_kind,
+	SearchRequest, SearchResponse, SessionSummary, SessionsRequest, SessionsResponse,
+	StoredRequestLog, StoredRequestLogPayload, TailRequest, TailResponse, TimeRange, TurnEntry,
+	UsageEntry, analytics_window, attr_filter_values, decode_cursor, encode_cursor, limit,
+	promoted_attribute_column, prompt_preview, turn_kind,
 };
 
 pub struct PostgresLogStore {
@@ -245,6 +246,110 @@ impl PostgresLogStore {
 			.map(|log| encode_cursor(log.completed_at, &log.id));
 		Ok(TailResponse { logs, next_cursor })
 	}
+
+	pub async fn search_sessions(
+		&self,
+		request: SessionsRequest,
+	) -> anyhow::Result<SessionsResponse> {
+		let limit = limit(request.limit);
+		let mut qb = QueryBuilder::<Postgres>::new(
+			"SELECT agentgateway_session AS session, MIN(completed_at) AS started_at, \
+			 MAX(completed_at) AS last_seen, COUNT(*) AS requests, \
+			 COALESCE(SUM(total_tokens), 0)::BIGINT AS total_tokens, \
+			 COALESCE(SUM(cost), 0.0)::DOUBLE PRECISION AS cost, \
+			 SUM(CASE WHEN http_status >= 400 THEN 1 ELSE 0 END) AS errors, \
+			 MIN(id) AS first_log_id, MAX(id) AS last_log_id \
+			 FROM request_logs WHERE agentgateway_session IS NOT NULL AND agentgateway_session != ''",
+		);
+		push_filters(&mut qb, request.time_range.as_ref(), &request.filters);
+		qb.push(" GROUP BY agentgateway_session");
+		if let Some(cursor) = request.cursor.as_deref() {
+			let (last_seen, session) = decode_cursor(cursor)?;
+			qb.push(" HAVING (MAX(completed_at), agentgateway_session) < (");
+			qb.push_bind(last_seen);
+			qb.push(", ");
+			qb.push_bind(session);
+			qb.push(")");
+		}
+		qb.push(" ORDER BY MAX(completed_at) DESC, agentgateway_session DESC LIMIT ");
+		qb.push_bind(limit + 1);
+		let rows = qb.build().fetch_all(&self.pool).await?;
+
+		struct SessionRow {
+			session: String,
+			started_at: chrono::DateTime<chrono::Utc>,
+			last_seen: chrono::DateTime<chrono::Utc>,
+			requests: i64,
+			total_tokens: i64,
+			cost: f64,
+			errors: i64,
+			first_log_id: String,
+			last_log_id: String,
+		}
+		let mut rows_out = Vec::with_capacity(rows.len());
+		for row in rows {
+			rows_out.push(SessionRow {
+				session: row.try_get("session")?,
+				started_at: row.try_get("started_at")?,
+				last_seen: row.try_get("last_seen")?,
+				requests: row.try_get("requests")?,
+				total_tokens: row.try_get("total_tokens")?,
+				cost: row.try_get("cost")?,
+				errors: row.try_get("errors")?,
+				first_log_id: row.try_get("first_log_id")?,
+				last_log_id: row.try_get("last_log_id")?,
+			});
+		}
+
+		let next_cursor = if rows_out.len() > limit as usize {
+			rows_out.pop();
+			rows_out
+				.last()
+				.map(|s| encode_cursor(s.last_seen, &s.session))
+		} else {
+			None
+		};
+
+		// Titles come from the first request of each session. UUIDv7 log ids sort by time,
+		// so MIN(id) per session is its earliest request.
+		let mut titles = std::collections::HashMap::new();
+		if !rows_out.is_empty() {
+			let mut tq = QueryBuilder::<Postgres>::new(
+				"SELECT r.id AS id, p.request_prompt_json AS prompt \
+				 FROM request_logs r LEFT JOIN request_log_payloads p ON r.id = p.log_id WHERE r.id IN (",
+			);
+			let mut separated = tq.separated(", ");
+			for session in &rows_out {
+				separated.push_bind(&session.first_log_id);
+			}
+			separated.push_unseparated(")");
+			let title_rows = tq.build().fetch_all(&self.pool).await?;
+			for row in title_rows {
+				let id: String = row.try_get("id")?;
+				let prompt: Option<Json<Value>> = row.try_get("prompt")?;
+				titles.insert(id, prompt_preview(prompt.as_ref().map(|value| &value.0)));
+			}
+		}
+
+		let sessions = rows_out
+			.into_iter()
+			.map(|s| SessionSummary {
+				title: titles.get(&s.first_log_id).cloned().flatten(),
+				session: s.session,
+				started_at: s.started_at,
+				last_seen: s.last_seen,
+				requests: s.requests,
+				total_tokens: s.total_tokens,
+				cost: s.cost,
+				errors: s.errors,
+				last_log_id: Some(s.last_log_id),
+			})
+			.collect();
+		Ok(SessionsResponse {
+			sessions,
+			next_cursor,
+		})
+	}
 }
 
 async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
@@ -311,6 +416,7 @@ fn push_request_log_copy_row(buf: &mut String, record: &StoredRequestLog) -> any
 	push_copy_display_column(buf, &mut first, record.cost);
 	push_copy_text_column(buf, &mut first, record.agentgateway_user.as_deref());
 	push_copy_text_column(buf, &mut first, record.agentgateway_group.as_deref());
+	push_copy_text_column(buf, &mut first, record.agentgateway_session.as_deref());
 	push_copy_text_column(buf, &mut first, record.user_agent_name.as_deref());
 	push_copy_display_column(buf, &mut first, Some(record.has_payload));
 	push_copy_text_column(buf, &mut first, Some(record.attributes_json.as_ref()));
@@ -593,6 +699,7 @@ fn row_to_log(
 		},
 		cost: row.try_get("cost")?,
 		has_payload: row.try_get("has_payload")?,
+		session: row.try_get("agentgateway_session")?,
 		attributes: include_attributes.then_some(attributes.0),
 		payload,
 	})
@@ -616,7 +723,7 @@ COPY request_logs (
 	id, started_at, completed_at, duration_ms, trace_id, span_id, http_status, error,
 	gen_ai_operation_name, gen_ai_provider_name, gen_ai_request_model, gen_ai_response_model,
 	input_tokens, output_tokens, total_tokens, cost, agentgateway_user, agentgateway_group,
-	user_agent_name, has_payload, attributes_json
+	agentgateway_session, user_agent_name, has_payload, attributes_json
 ) FROM STDIN
 "#;
 
@@ -627,8 +734,8 @@ COPY request_log_payloads (log_id, request_prompt_json, response_completion_json
 const SELECT_LOGS: &str = r#"
 SELECT id, started_at, completed_at, duration_ms, trace_id, span_id, http_status::BIGINT AS http_status, error,
 	gen_ai_operation_name, gen_ai_provider_name, gen_ai_request_model, gen_ai_response_model,
-	input_tokens, output_tokens, total_tokens, cost, has_payload, attributes_json,
-	request_prompt_json, response_completion_json
+	input_tokens, output_tokens, total_tokens, cost, has_payload, agentgateway_session,
+	attributes_json, request_prompt_json, response_completion_json
 FROM request_logs
 LEFT JOIN request_log_payloads ON request_logs.id = request_log_payloads.log_id
 "#;
@@ -636,8 +743,8 @@ LEFT JOIN request_log_payloads ON request_logs.id = request_log_payloads.log_id
 const SELECT_LOG_BY_ID: &str = r#"
 SELECT id, started_at, completed_at, duration_ms, trace_id, span_id, http_status::BIGINT AS http_status, error,
 	gen_ai_operation_name, gen_ai_provider_name, gen_ai_request_model, gen_ai_response_model,
-	input_tokens, output_tokens, total_tokens, cost, has_payload, attributes_json,
-	request_prompt_json, response_completion_json
+	input_tokens, output_tokens, total_tokens, cost, has_payload, agentgateway_session,
+	attributes_json, request_prompt_json, response_completion_json
 FROM request_logs
 LEFT JOIN request_log_payloads ON request_logs.id = request_log_payloads.log_id
 WHERE request_logs.id = $1

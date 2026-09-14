@@ -54,11 +54,14 @@ pub fn generate_schema() -> Result<()> {
 		};
 		let mut readme = format!("# {} Schema\n\n", schema.name);
 		let rule_path = format!("{xtask_path}/../../schema/{}", schema.file);
-		let o = if cfg!(target_os = "windows") {
-			let cmd_path: String = format!("{xtask_path}/../../tools/schema-to-md.ps1");
+		// Prefer the PowerShell helper when present; fall back to the shell helper through
+		// bash so `cargo xtask schema` also works on Windows checkouts without the ps1.
+		let ps1_path = format!("{xtask_path}/../../tools/schema-to-md.ps1");
+		let use_ps1 = cfg!(target_os = "windows") && std::path::Path::new(&ps1_path).exists();
+		let o = if use_ps1 {
 			std::process::Command::new("powershell")
 				.arg("-Command")
-				.arg(cmd_path)
+				.arg(&ps1_path)
 				.arg(&rule_path)
 				.output()?
 		} else {
@@ -73,9 +76,16 @@ pub fn generate_schema() -> Result<()> {
 			)?;
 
 			let cmd_path: String = format!("{xtask_path}/../../tools/schema-to-md.sh");
-			let output = std::process::Command::new(cmd_path)
-				.arg(&inline_rule_path)
-				.output();
+			let mut command = if cfg!(target_os = "windows") {
+				let mut command = windows_bash().ok_or_else(|| {
+					anyhow::anyhow!("bash not found; install Git for Windows or add tools/schema-to-md.ps1")
+				})?;
+				command.arg(&cmd_path);
+				command
+			} else {
+				std::process::Command::new(&cmd_path)
+			};
+			let output = command.arg(&inline_rule_path).output();
 			let _ = fs_err::remove_file(&inline_rule_path);
 			output?
 		};
@@ -91,6 +101,33 @@ pub fn generate_schema() -> Result<()> {
 		file.write_all(readme.as_bytes())?;
 	}
 	Ok(())
+}
+
+/// Locate a usable bash on Windows. Plain `bash` resolves to the WSL launcher in
+/// System32, which cannot run these scripts, so derive bash from the Git installation
+/// found on PATH (git.exe lives at `<root>/cmd` or `<root>/mingw64/bin`).
+fn windows_bash() -> Option<std::process::Command> {
+	let exec_path = std::process::Command::new("git")
+		.arg("--exec-path")
+		.output()
+		.ok()
+		.map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+	let git_root = exec_path
+		.as_deref()
+		.and_then(|exec| std::path::Path::new(exec).ancestors().nth(3))
+		.map(std::path::Path::to_path_buf);
+	let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+	if let Some(root) = git_root {
+		candidates.push(root.join("bin").join("bash.exe"));
+		candidates.push(root.join("usr").join("bin").join("bash.exe"));
+	}
+	if let Ok(shell) = std::env::var("SHELL") {
+		candidates.push(std::path::PathBuf::from(shell));
+	}
+	candidates
+		.into_iter()
+		.find(|candidate| candidate.is_file())
+		.map(std::process::Command::new)
 }
 
 fn dedupe_lines(input: &str) -> String {

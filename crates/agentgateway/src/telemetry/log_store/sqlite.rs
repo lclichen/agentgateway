@@ -1,3 +1,4 @@
+use anyhow::Context;
 use serde_json::Value;
 use sqlx::types::Json;
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, query_builder};
@@ -5,9 +6,10 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, query_builder};
 use super::{
 	AnalyticsGroup, AnalyticsSummaryRequest, AnalyticsSummaryResponse, AnalyticsTimeBucket,
 	GenAiEntry, GetRequest, GetResponse, GroupBy, GroupByField, LogEntry, LogFilters, PayloadEntry,
-	SearchRequest, SearchResponse, StoredRequestLog, StoredRequestLogPayload, TailRequest,
-	TailResponse, TimeRange, TurnEntry, UsageEntry, analytics_window, attr_filter_values,
-	decode_cursor, encode_cursor, limit, promoted_attribute_column, prompt_preview, turn_kind,
+	SearchRequest, SearchResponse, SessionSummary, SessionsRequest, SessionsResponse,
+	StoredRequestLog, StoredRequestLogPayload, TailRequest, TailResponse, TimeRange, TurnEntry,
+	UsageEntry, analytics_window, attr_filter_values, decode_cursor, encode_cursor, limit,
+	promoted_attribute_column, prompt_preview, turn_kind,
 };
 
 pub struct SqliteLogStore {
@@ -23,8 +25,8 @@ INSERT INTO request_logs (
 	id, started_at, completed_at, duration_ms, trace_id, span_id, http_status, error,
 	gen_ai_operation_name, gen_ai_provider_name, gen_ai_request_model, gen_ai_response_model,
 	input_tokens, output_tokens, total_tokens, cost, agentgateway_user, agentgateway_group,
-	user_agent_name, has_payload, attributes_json
-) 
+	agentgateway_session, user_agent_name, has_payload, attributes_json
+)
 "#;
 
 const INSERT_PAYLOAD_PREFIX: &str = r#"
@@ -54,6 +56,7 @@ fn push_request_log_row(
 		.push_bind(record.cost)
 		.push_bind(&record.agentgateway_user)
 		.push_bind(&record.agentgateway_group)
+		.push_bind(&record.agentgateway_session)
 		.push_bind(&record.user_agent_name)
 		.push_bind(record.has_payload)
 		.push_bind(record.attributes_json.as_ref());
@@ -72,7 +75,31 @@ fn push_request_log_payload_row(
 
 impl SqliteLogStore {
 	pub async fn from_pool(pool: SqlitePool) -> anyhow::Result<Self> {
+		// Run the base schema first (CREATE IF NOT EXISTS), then backfill the session column
+		// on databases created before it existed, and only then create its index. The index
+		// must not be created before the ALTER because it references the new column.
 		sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+		let session_column: i64 = sqlx::query_scalar(
+			"SELECT COUNT(*) FROM pragma_table_info('request_logs') WHERE name = 'agentgateway_session'",
+		)
+		.fetch_one(&pool)
+		.await?;
+		if session_column == 0
+			&& let Err(err) =
+				sqlx::raw_sql("ALTER TABLE request_logs ADD COLUMN agentgateway_session TEXT")
+					.execute(&pool)
+					.await
+		{
+			// Another process may have added the column between the check and the
+			// ALTER when several gateways share one database file; that races cleanly.
+			let duplicate = err
+				.as_database_error()
+				.is_some_and(|err| err.message().contains("duplicate column name"));
+			if !duplicate {
+				return Err(err).context("failed to add agentgateway_session column");
+			}
+		}
+		sqlx::raw_sql(SESSION_INDEX).execute(&pool).await?;
 		Ok(Self { pool })
 	}
 
@@ -296,6 +323,111 @@ impl SqliteLogStore {
 			.map(|log| encode_cursor(log.completed_at, &log.id));
 		Ok(TailResponse { logs, next_cursor })
 	}
+
+	pub async fn search_sessions(
+		&self,
+		request: SessionsRequest,
+	) -> anyhow::Result<SessionsResponse> {
+		let limit = limit(request.limit);
+		let mut qb = QueryBuilder::<Sqlite>::new(
+			"SELECT agentgateway_session AS session, MIN(completed_at) AS started_at, \
+			 MAX(completed_at) AS last_seen, COUNT(*) AS requests, \
+			 COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(cost), 0.0) AS cost, \
+			 SUM(CASE WHEN http_status >= 400 THEN 1 ELSE 0 END) AS errors, \
+			 MIN(id) AS first_log_id, MAX(id) AS last_log_id \
+			 FROM request_logs WHERE agentgateway_session IS NOT NULL AND agentgateway_session != ''",
+		);
+		push_filters(&mut qb, request.time_range.as_ref(), &request.filters);
+		qb.push(" GROUP BY agentgateway_session");
+		if let Some(cursor) = request.cursor.as_deref() {
+			let (last_seen, session) = decode_cursor(cursor)?;
+			qb.push(" HAVING MAX(completed_at) < ");
+			qb.push_bind(last_seen);
+			qb.push(" OR (MAX(completed_at) = ");
+			qb.push_bind(last_seen);
+			qb.push(" AND agentgateway_session < ");
+			qb.push_bind(session);
+			qb.push(")");
+		}
+		qb.push(" ORDER BY MAX(completed_at) DESC, agentgateway_session DESC LIMIT ");
+		qb.push_bind(limit + 1);
+		let rows = qb.build().fetch_all(&self.pool).await?;
+
+		struct SessionRow {
+			session: String,
+			started_at: chrono::DateTime<chrono::Utc>,
+			last_seen: chrono::DateTime<chrono::Utc>,
+			requests: i64,
+			total_tokens: i64,
+			cost: f64,
+			errors: i64,
+			first_log_id: String,
+			last_log_id: String,
+		}
+		let mut rows_out = Vec::with_capacity(rows.len());
+		for row in rows {
+			rows_out.push(SessionRow {
+				session: row.try_get("session")?,
+				started_at: row.try_get("started_at")?,
+				last_seen: row.try_get("last_seen")?,
+				requests: row.try_get("requests")?,
+				total_tokens: row.try_get("total_tokens")?,
+				cost: row.try_get("cost")?,
+				errors: row.try_get("errors")?,
+				first_log_id: row.try_get("first_log_id")?,
+				last_log_id: row.try_get("last_log_id")?,
+			});
+		}
+
+		let next_cursor = if rows_out.len() > limit as usize {
+			rows_out.pop();
+			rows_out
+				.last()
+				.map(|s| encode_cursor(s.last_seen, &s.session))
+		} else {
+			None
+		};
+
+		// Titles come from the first request of each session. UUIDv7 log ids sort by time,
+		// so MIN(id) per session is its earliest request.
+		let mut titles = std::collections::HashMap::new();
+		if !rows_out.is_empty() {
+			let mut tq = QueryBuilder::<Sqlite>::new(
+				"SELECT r.id AS id, p.request_prompt_json AS prompt \
+				 FROM request_logs r LEFT JOIN request_log_payloads p ON r.id = p.log_id WHERE r.id IN (",
+			);
+			let mut separated = tq.separated(", ");
+			for session in &rows_out {
+				separated.push_bind(&session.first_log_id);
+			}
+			separated.push_unseparated(")");
+			let title_rows = tq.build().fetch_all(&self.pool).await?;
+			for row in title_rows {
+				let id: String = row.try_get("id")?;
+				let prompt: Option<Json<Value>> = row.try_get("prompt")?;
+				titles.insert(id, prompt_preview(prompt.as_ref().map(|value| &value.0)));
+			}
+		}
+
+		let sessions = rows_out
+			.into_iter()
+			.map(|s| SessionSummary {
+				title: titles.get(&s.first_log_id).cloned().flatten(),
+				session: s.session,
+				started_at: s.started_at,
+				last_seen: s.last_seen,
+				requests: s.requests,
+				total_tokens: s.total_tokens,
+				cost: s.cost,
+				errors: s.errors,
+				last_log_id: Some(s.last_log_id),
+			})
+			.collect();
+		Ok(SessionsResponse {
+			sessions,
+			next_cursor,
+		})
+	}
 }
 
 fn groups_from_buckets(buckets: &[AnalyticsTimeBucket]) -> Vec<AnalyticsGroup> {
@@ -332,6 +464,7 @@ fn distinct_option_index(column: &str) -> Option<&'static str> {
 		"gen_ai_request_model" => Some("idx_request_logs_request_model_completed_at"),
 		"agentgateway_user" => Some("idx_request_logs_user_completed_at"),
 		"agentgateway_group" => Some("idx_request_logs_group_completed_at"),
+		"agentgateway_session" => Some("idx_request_logs_session_completed_at"),
 		"user_agent_name" => Some("idx_request_logs_user_agent_completed_at"),
 		_ => None,
 	}
@@ -520,6 +653,7 @@ fn row_to_log(
 		},
 		cost: row.try_get("cost")?,
 		has_payload: row.try_get("has_payload")?,
+		session: row.try_get("agentgateway_session")?,
 		attributes: include_attributes.then_some(attributes.0),
 		payload,
 	})
@@ -589,6 +723,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
 	cost REAL,
 	agentgateway_user TEXT,
 	agentgateway_group TEXT,
+	agentgateway_session TEXT,
 	user_agent_name TEXT,
 	has_payload INTEGER NOT NULL,
 	attributes_json TEXT NOT NULL
@@ -610,11 +745,16 @@ CREATE INDEX IF NOT EXISTS idx_request_logs_group_completed_at ON request_logs(a
 CREATE INDEX IF NOT EXISTS idx_request_logs_user_agent_completed_at ON request_logs(user_agent_name, completed_at DESC, id DESC);
 "#;
 
+// Applied after the agentgateway_session column is guaranteed to exist; see from_pool.
+const SESSION_INDEX: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_request_logs_session_completed_at ON request_logs(agentgateway_session, completed_at DESC, id DESC);
+"#;
+
 const SELECT_LOGS: &str = r#"
 SELECT id, started_at, completed_at, duration_ms, trace_id, span_id, http_status, error,
 	gen_ai_operation_name, gen_ai_provider_name, gen_ai_request_model, gen_ai_response_model,
-	input_tokens, output_tokens, total_tokens, cost, has_payload, attributes_json,
-	request_prompt_json, response_completion_json
+	input_tokens, output_tokens, total_tokens, cost, has_payload, agentgateway_session,
+	attributes_json, request_prompt_json, response_completion_json
 FROM request_logs
 LEFT JOIN request_log_payloads ON request_logs.id = request_log_payloads.log_id
 "#;
@@ -622,9 +762,262 @@ LEFT JOIN request_log_payloads ON request_logs.id = request_log_payloads.log_id
 const SELECT_LOG_BY_ID: &str = r#"
 SELECT id, started_at, completed_at, duration_ms, trace_id, span_id, http_status, error,
 	gen_ai_operation_name, gen_ai_provider_name, gen_ai_request_model, gen_ai_response_model,
-	input_tokens, output_tokens, total_tokens, cost, has_payload, attributes_json,
-	request_prompt_json, response_completion_json
+	input_tokens, output_tokens, total_tokens, cost, has_payload, agentgateway_session,
+	attributes_json, request_prompt_json, response_completion_json
 FROM request_logs
 LEFT JOIN request_log_payloads ON request_logs.id = request_log_payloads.log_id
 WHERE request_logs.id = ?
 "#;
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use chrono::{TimeZone, Utc};
+	use sqlx::sqlite::SqlitePoolOptions;
+
+	pub(crate) async fn memory_pool() -> SqlitePool {
+		SqlitePoolOptions::new()
+			.max_connections(1)
+			.connect("sqlite::memory:")
+			.await
+			.expect("in-memory sqlite pool")
+	}
+
+	pub(crate) fn sample(
+		id: &str,
+		session: Option<&str>,
+		completed_at: chrono::DateTime<chrono::Utc>,
+		payload: Option<StoredRequestLogPayload>,
+	) -> StoredRequestLog {
+		StoredRequestLog {
+			id: id.to_string(),
+			started_at: completed_at - chrono::Duration::seconds(1),
+			completed_at,
+			duration_ms: 10,
+			trace_id: None,
+			span_id: None,
+			http_status: Some(200),
+			error: None,
+			gen_ai_operation_name: Some("chat".to_string()),
+			gen_ai_provider_name: None,
+			gen_ai_request_model: Some("test-model".to_string()),
+			gen_ai_response_model: None,
+			input_tokens: Some(10),
+			output_tokens: Some(20),
+			total_tokens: Some(30),
+			cost: Some(0.5),
+			agentgateway_user: None,
+			agentgateway_group: None,
+			agentgateway_session: session.map(str::to_string),
+			user_agent_name: None,
+			has_payload: payload.is_some(),
+			attributes_json: "{}".into(),
+			payload,
+		}
+	}
+
+	fn prompt_payload(text: &str) -> StoredRequestLogPayload {
+		StoredRequestLogPayload {
+			request_prompt_json: Some(serde_json::json!([
+				{"role": "user", "parts": [{"type": "text", "text": text}]}
+			])),
+			response_completion_json: None,
+		}
+	}
+
+	#[tokio::test]
+	async fn search_sessions_aggregates_by_session() {
+		let store = SqliteLogStore::from_pool(memory_pool().await)
+			.await
+			.unwrap();
+		let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+		let records = vec![
+			sample(
+				"0001",
+				Some("session-a"),
+				base,
+				Some(prompt_payload("first question")),
+			),
+			sample(
+				"0002",
+				Some("session-a"),
+				base + chrono::Duration::seconds(10),
+				None,
+			),
+			sample(
+				"0003",
+				Some("session-b"),
+				base + chrono::Duration::seconds(5),
+				None,
+			),
+			sample("0004", None, base + chrono::Duration::seconds(6), None),
+		];
+		store.insert_batch(&records).await.unwrap();
+
+		let response = store
+			.search_sessions(SessionsRequest {
+				limit: Some(10),
+				..Default::default()
+			})
+			.await
+			.unwrap();
+
+		// Newest session first; the sessionless row must not appear.
+		assert_eq!(response.sessions.len(), 2);
+		assert_eq!(response.next_cursor, None);
+
+		let a = response
+			.sessions
+			.iter()
+			.find(|s| s.session == "session-a")
+			.expect("session-a");
+		assert_eq!(a.requests, 2);
+		assert_eq!(a.total_tokens, 60);
+		assert_eq!(a.cost, 1.0);
+		assert_eq!(a.errors, 0);
+		assert_eq!(a.title.as_deref(), Some("first question"));
+		assert_eq!(a.last_log_id.as_deref(), Some("0002"));
+
+		let b = response
+			.sessions
+			.iter()
+			.find(|s| s.session == "session-b")
+			.expect("session-b");
+		assert_eq!(b.requests, 1);
+		assert_eq!(b.title, None);
+
+		// Ordering: session-b was last seen before session-a.
+		assert_eq!(response.sessions[0].session, "session-a");
+
+		let search = store
+			.search(SearchRequest {
+				limit: Some(10),
+				cursor: None,
+				time_range: None,
+				filters: LogFilters::default(),
+				include_attributes: false,
+			})
+			.await
+			.unwrap();
+		let by_id = |id: &str| search.logs.iter().find(|log| log.id == id).unwrap();
+		assert_eq!(by_id("0001").session.as_deref(), Some("session-a"));
+		assert_eq!(by_id("0003").session.as_deref(), Some("session-b"));
+		assert_eq!(by_id("0004").session, None);
+	}
+
+	#[tokio::test]
+	async fn search_sessions_paginates_by_cursor() {
+		let store = SqliteLogStore::from_pool(memory_pool().await)
+			.await
+			.unwrap();
+		let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+		let records = vec![
+			sample("0001", Some("session-old"), base, None),
+			sample(
+				"0002",
+				Some("session-new"),
+				base + chrono::Duration::seconds(10),
+				None,
+			),
+		];
+		store.insert_batch(&records).await.unwrap();
+
+		let first_page = store
+			.search_sessions(SessionsRequest {
+				limit: Some(1),
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		assert_eq!(first_page.sessions.len(), 1);
+		assert_eq!(first_page.sessions[0].session, "session-new");
+		let cursor = first_page.next_cursor.expect("cursor");
+
+		let second_page = store
+			.search_sessions(SessionsRequest {
+				limit: Some(1),
+				cursor: Some(cursor),
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		assert_eq!(second_page.sessions.len(), 1);
+		assert_eq!(second_page.sessions[0].session, "session-old");
+		assert_eq!(second_page.next_cursor, None);
+	}
+
+	#[tokio::test]
+	async fn migrates_database_without_session_column() {
+		let pool = memory_pool().await;
+		// Simulate a database created before agentgateway_session existed.
+		sqlx::raw_sql(
+			r#"
+			CREATE TABLE request_logs (
+				id TEXT PRIMARY KEY,
+				started_at TEXT NOT NULL,
+				completed_at TEXT NOT NULL,
+				duration_ms INTEGER NOT NULL,
+				trace_id TEXT,
+				span_id TEXT,
+				http_status INTEGER,
+				error TEXT,
+				gen_ai_operation_name TEXT,
+				gen_ai_provider_name TEXT,
+				gen_ai_request_model TEXT,
+				gen_ai_response_model TEXT,
+				input_tokens INTEGER,
+				output_tokens INTEGER,
+				total_tokens INTEGER,
+				cost REAL,
+				agentgateway_user TEXT,
+				agentgateway_group TEXT,
+				user_agent_name TEXT,
+				has_payload INTEGER NOT NULL,
+				attributes_json TEXT NOT NULL
+			);
+			INSERT INTO request_logs (
+				id, started_at, completed_at, duration_ms, http_status, has_payload, attributes_json
+			) VALUES ('legacy', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:01+00:00', 1, 200, 0, '{}');
+			"#,
+		)
+		.execute(&pool)
+		.await
+		.unwrap();
+
+		let store = SqliteLogStore::from_pool(pool).await.unwrap();
+		store
+			.insert_batch(&[sample(
+				"0001",
+				Some("session-a"),
+				Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, 0).unwrap(),
+				None,
+			)])
+			.await
+			.unwrap();
+
+		let response = store
+			.search_sessions(SessionsRequest::default())
+			.await
+			.unwrap();
+		assert_eq!(response.sessions.len(), 1);
+		assert_eq!(response.sessions[0].session, "session-a");
+
+		// The legacy row is still readable and reports no session.
+		let search = store
+			.search(SearchRequest {
+				limit: Some(10),
+				cursor: None,
+				time_range: None,
+				filters: LogFilters::default(),
+				include_attributes: false,
+			})
+			.await
+			.unwrap();
+		let legacy = search
+			.logs
+			.iter()
+			.find(|log| log.id == "legacy")
+			.expect("legacy row");
+		assert_eq!(legacy.session, None);
+	}
+}

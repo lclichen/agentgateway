@@ -17,6 +17,7 @@ import {
 	LogOut,
 	Menu,
 	MessageSquarePlus,
+	MessagesSquare,
 	Moon,
 	Network,
 	Play,
@@ -330,6 +331,7 @@ function navigationGroups(options: {
 							groupStart: true
 						},
 						{ to: '/llm/logs', label: 'Logs', icon: ScrollText },
+						{ to: '/llm/sessions', label: 'Sessions', icon: MessagesSquare },
 
 						{
 							to: '/llm/client-setup',
