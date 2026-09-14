@@ -11,3 +11,6 @@ schema/*.json linguist-generated=true
 schema/cel.md linguist-generated=true
 schema/config.md linguist-generated=true
 ui/** text=auto eol=lf
+
+# The schema-to-md helper runs under bash; CRLF checkouts break it on Windows.
+tools/*.sh text eol=lf

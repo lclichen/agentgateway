@@ -78,9 +78,8 @@ pub struct RawStandardAttributes {
 	/// CEL expression used to populate the `agentgateway.group` request log attribute.
 	#[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
 	pub group: Option<String>,
-	/// CEL expression identifying the session a request belongs to, exposed to CEL as `request.agent.session`.
-	/// If unset, or if the expression fails, the session is detected from well-known agent headers
-	/// such as `x-claude-code-session-id`. Return `null` to mark the request as having no session.
+	/// CEL expression used to populate the `agentgateway.session` request log attribute.
+	/// Sessions are stored in a dedicated indexed column and power the UI conversation view.
 	#[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
 	pub session: Option<String>,
 }
