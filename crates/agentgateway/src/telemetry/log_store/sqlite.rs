@@ -4,14 +4,15 @@ use sqlx::types::Json;
 use sqlx::{FromRow, QueryBuilder, Row, Sqlite, SqlitePool, query_builder};
 
 use super::{
-	ANALYTICS_TOTALS_SELECT, AnalyticsGroup, AnalyticsSummaryRequest, AnalyticsSummaryResponse,
-	AnalyticsTimeBucket, AnalyticsTotals, GenAiEntry, GetRequest, GetResponse, GroupBy,
+	ANALYTICS_TOTALS_SELECT, AnalyticsSummaryRequest, AnalyticsSummaryResponse,
+	AnalyticsTimeBucket, AnalyticsTotals, FeedbackEntry, FeedbackItem, FeedbackUpsertRequest,
+	FeedbackUpsertResponse, FeedbackValue, GenAiEntry, GetRequest, GetResponse, GroupBy,
 	GroupByField, LogEntry, LogFilters, MIGRATIONS_TABLE, OUTPUT_TOKENS_PER_SECOND_BOUNDS,
 	PayloadEntry, SearchRequest, SearchResponse, SessionSummary, SessionsRequest, SessionsResponse,
 	StoredRequestLog, StoredRequestLogPayload, TTFT_BOUNDS_MS, TailRequest, TailResponse,
 	TimeRange, TurnEntry, UsageEntry, analytics_window, attr_filter_values, decode_cursor,
 	encode_cursor, groups_from_buckets, histogram_bucket_sql, limit,
-	promoted_attribute_column, prompt_preview, turn_kind,
+	promoted_attribute_column, prompt_preview, truncate_snippet, turn_kind,
 };
 
 pub struct SqliteLogStore {
@@ -164,7 +165,7 @@ impl SqliteLogStore {
 		let rows = qb.build().fetch_all(&self.pool).await?;
 		let mut logs = rows
 			.into_iter()
-			.map(|row| row_to_log(row, request.include_attributes, false))
+			.map(|row| row_to_log(row, request.include_attributes, request.include_payload))
 			.collect::<Result<Vec<_>, _>>()?;
 		let next_cursor = if logs.len() > limit as usize {
 			let _ = logs.pop();
@@ -446,6 +447,103 @@ impl SqliteLogStore {
 			next_cursor,
 		})
 	}
+
+	pub async fn feedback_upsert(
+		&self,
+		request: FeedbackUpsertRequest,
+	) -> anyhow::Result<FeedbackUpsertResponse> {
+		let now = chrono::Utc::now();
+		let mut tx = self.pool.begin().await?;
+		let mut accepted = Vec::with_capacity(request.feedback.len());
+		for item in &request.feedback {
+			let (server_created_at, alignment) = self.align_feedback(&mut tx, item, now).await?;
+			sqlx::query(
+				r#"INSERT INTO message_feedback (
+					session_id, entry_id, value, snippet, client_created_at, server_created_at,
+					username, model, log_id
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+				ON CONFLICT(session_id, entry_id) DO UPDATE SET
+					value = excluded.value,
+					snippet = excluded.snippet,
+					client_created_at = excluded.client_created_at,
+					server_created_at = excluded.server_created_at,
+					username = excluded.username,
+					model = excluded.model,
+					log_id = excluded.log_id
+				"#,
+			)
+			.bind(&item.session_id)
+			.bind(&item.entry_id)
+			.bind(item.value.as_str())
+			.bind(truncate_snippet(item.snippet.as_deref()))
+			.bind(item.created_at)
+			.bind(server_created_at)
+			.bind(request.user.as_deref())
+			.bind(alignment.as_ref().and_then(|(_, model)| model.clone()))
+			.bind(alignment.as_ref().map(|(log_id, _)| log_id.clone()))
+			.execute(&mut *tx)
+			.await?;
+			accepted.push(format!("{}:{}", item.session_id, item.entry_id));
+		}
+		tx.commit().await?;
+		Ok(FeedbackUpsertResponse { accepted })
+	}
+
+	/// Best-effort alignment of a feedback item to the LLM call it refers to: the latest
+	/// logged request in the same session at or before the feedback timestamp. entryId is a
+	/// client-side session-file concept the gateway never sees, so this is a heuristic.
+	/// Runs on the caller's transaction connection: the pool may be a single connection.
+	async fn align_feedback(
+		&self,
+		conn: &mut sqlx::SqliteConnection,
+		item: &FeedbackItem,
+		now: chrono::DateTime<chrono::Utc>,
+	) -> anyhow::Result<(
+		chrono::DateTime<chrono::Utc>,
+		Option<(String, Option<String>)>,
+	)> {
+		let created_at = item
+			.created_at
+			.and_then(chrono::DateTime::from_timestamp_millis)
+			.unwrap_or(now);
+		let aligned: Option<(String, Option<String>)> = sqlx::query_as(
+			"SELECT id, gen_ai_request_model FROM request_logs \
+			 WHERE agentgateway_session = ? AND completed_at <= ? \
+			 ORDER BY completed_at DESC, id DESC LIMIT 1",
+		)
+		.bind(&item.session_id)
+		.bind(created_at)
+		.fetch_optional(conn)
+		.await?;
+		Ok((now, aligned))
+	}
+
+	pub async fn feedback_export(&self) -> anyhow::Result<Vec<FeedbackEntry>> {
+		let rows = sqlx::query(
+			"SELECT session_id, entry_id, value, snippet, client_created_at, server_created_at, \
+			 username, model, log_id \
+			 FROM message_feedback ORDER BY server_created_at ASC, session_id ASC, entry_id ASC",
+		)
+		.fetch_all(&self.pool)
+		.await?;
+		rows
+			.into_iter()
+			.map(|row| {
+				let value: String = row.try_get("value")?;
+				Ok(FeedbackEntry {
+					session_id: row.try_get("session_id")?,
+					entry_id: row.try_get("entry_id")?,
+					value: FeedbackValue::parse(&value)?,
+					snippet: row.try_get("snippet")?,
+					client_created_at: row.try_get("client_created_at")?,
+					server_created_at: row.try_get("server_created_at")?,
+					username: row.try_get("username")?,
+					model: row.try_get("model")?,
+					log_id: row.try_get("log_id")?,
+				})
+			})
+			.collect()
+	}
 }
 
 fn analytics_filter_option_map() -> std::collections::BTreeMap<String, Vec<String>> {
@@ -633,7 +731,7 @@ fn row_to_log(
 		input: turn_kind(request_prompt.as_ref().map(|value| &value.0)),
 		output: turn_kind(response_completion.as_ref().map(|value| &value.0)),
 	};
-	let payload = if include_payload {
+	let payload = if include_payload && (request_prompt.is_some() || response_completion.is_some()) {
 		Some(PayloadEntry {
 			request_prompt: request_prompt.map(|v| v.0),
 			response_completion: response_completion.map(|v| v.0),
@@ -961,6 +1059,7 @@ INSERT INTO request_logs VALUES (
 				time_range: None,
 				filters: LogFilters::default(),
 				include_attributes: false,
+				include_payload: false,
 			})
 			.await
 			.unwrap();
@@ -968,6 +1067,87 @@ INSERT INTO request_logs VALUES (
 		assert_eq!(by_id("0001").session.as_deref(), Some("session-a"));
 		assert_eq!(by_id("0003").session.as_deref(), Some("session-b"));
 		assert_eq!(by_id("0004").session, None);
+	}
+
+	#[tokio::test]
+	async fn search_sessions_reports_user_and_filters_by_user() {
+		let store = SqliteLogStore::from_pool(memory_pool().await)
+			.await
+			.unwrap();
+		let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+		let mut a1 = sample("0001", Some("session-a"), base, None);
+		a1.agentgateway_user = Some("alice".to_string());
+		let mut a2 = sample(
+			"0002",
+			Some("session-a"),
+			base + chrono::Duration::seconds(10),
+			None,
+		);
+		a2.agentgateway_user = Some("alice".to_string());
+		let mut b = sample("0003", Some("session-b"), base + chrono::Duration::seconds(5), None);
+		b.agentgateway_user = Some("bob".to_string());
+		// session-c spans two users; the aggregate reports only one of them.
+		let mut c1 = sample(
+			"0004",
+			Some("session-c"),
+			base + chrono::Duration::seconds(20),
+			None,
+		);
+		c1.agentgateway_user = Some("alice".to_string());
+		let mut c2 = sample(
+			"0005",
+			Some("session-c"),
+			base + chrono::Duration::seconds(30),
+			None,
+		);
+		c2.agentgateway_user = Some("zoe".to_string());
+		let unattributed = sample(
+			"0006",
+			Some("session-d"),
+			base + chrono::Duration::seconds(40),
+			None,
+		);
+		store
+			.insert_batch(&[a1, a2, b, c1, c2, unattributed])
+			.await
+			.unwrap();
+
+		let response = store
+			.search_sessions(SessionsRequest {
+				limit: Some(10),
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		let by_session = |name: &str| {
+			response
+				.sessions
+				.iter()
+				.find(|summary| summary.session == name)
+				.unwrap_or_else(|| panic!("{name} missing"))
+		};
+		assert_eq!(by_session("session-a").user.as_deref(), Some("alice"));
+		assert_eq!(by_session("session-b").user.as_deref(), Some("bob"));
+		assert_eq!(by_session("session-c").user.as_deref(), Some("zoe"));
+		assert_eq!(by_session("session-d").user, None);
+
+		let filtered = store
+			.search_sessions(SessionsRequest {
+				limit: Some(10),
+				filters: LogFilters {
+					attributes: std::collections::BTreeMap::from([(
+						"agentgateway.user".to_string(),
+						serde_json::json!("bob"),
+					)]),
+					..Default::default()
+				},
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		assert_eq!(filtered.sessions.len(), 1);
+		assert_eq!(filtered.sessions[0].session, "session-b");
+		assert_eq!(filtered.sessions[0].user.as_deref(), Some("bob"));
 	}
 
 	#[tokio::test]
@@ -1075,6 +1255,7 @@ INSERT INTO request_logs VALUES (
 				time_range: None,
 				filters: LogFilters::default(),
 				include_attributes: false,
+				include_payload: false,
 			})
 			.await
 			.unwrap();
@@ -1084,5 +1265,110 @@ INSERT INTO request_logs VALUES (
 			.find(|log| log.id == "legacy")
 			.expect("legacy row");
 		assert_eq!(legacy.session, None);
+	}
+}
+
+#[cfg(test)]
+mod feedback_tests {
+	use super::tests::{memory_pool, sample};
+	use super::*;
+	use crate::telemetry::log_store::FeedbackUpsertRequest;
+	use chrono::{TimeZone, Utc};
+
+	fn item(session: &str, entry: &str, value: FeedbackValue, created_at: i64) -> FeedbackItem {
+		FeedbackItem {
+			session_id: session.to_string(),
+			entry_id: entry.to_string(),
+			value,
+			snippet: Some("short preview".to_string()),
+			created_at: Some(created_at),
+		}
+	}
+
+	#[tokio::test]
+	async fn feedback_upsert_is_idempotent_and_aligned() {
+		let store = SqliteLogStore::from_pool(memory_pool().await)
+			.await
+			.unwrap();
+		let base = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+		// Two LLM calls inside the session; feedback refers to the first one.
+		store
+			.insert_batch(&[
+				sample(
+					"0001",
+					Some("session-a"),
+					base,
+					Some(StoredRequestLogPayload {
+						request_prompt_json: Some(serde_json::json!([
+							{"role": "user", "parts": [{"type": "text", "text": "first"}]}
+						])),
+						response_completion_json: None,
+					}),
+				),
+				sample(
+					"0002",
+					Some("session-a"),
+					base + chrono::Duration::seconds(60),
+					None,
+				),
+			])
+			.await
+			.unwrap();
+
+		let feedback_created_at = base.timestamp_millis() + 30_000; // between the two calls
+		let response = store
+			.feedback_upsert(FeedbackUpsertRequest {
+				user: Some("alice".to_string()),
+				feedback: vec![item(
+					"session-a",
+					"entry-1",
+					FeedbackValue::Up,
+					feedback_created_at,
+				)],
+			})
+			.await
+			.unwrap();
+		assert_eq!(response.accepted, vec!["session-a:entry-1".to_string()]);
+
+		// Same entry re-submitted with the opposite value: upsert overwrites, still one row.
+		let response = store
+			.feedback_upsert(FeedbackUpsertRequest {
+				user: Some("alice".to_string()),
+				feedback: vec![item(
+					"session-a",
+					"entry-1",
+					FeedbackValue::Down,
+					feedback_created_at + 1_000,
+				)],
+			})
+			.await
+			.unwrap();
+		assert_eq!(response.accepted, vec!["session-a:entry-1".to_string()]);
+
+		let entries = store.feedback_export().await.unwrap();
+		assert_eq!(entries.len(), 1);
+		let entry = &entries[0];
+		assert_eq!(entry.value, FeedbackValue::Down);
+		assert_eq!(entry.username.as_deref(), Some("alice"));
+		// Aligned to the latest call at or before the feedback timestamp (0001, not 0002).
+		assert_eq!(entry.log_id.as_deref(), Some("0001"));
+		assert_eq!(entry.model.as_deref(), Some("test-model"));
+
+		// Unknown sessions still store (alignment is best-effort).
+		store
+			.feedback_upsert(FeedbackUpsertRequest {
+				user: None,
+				feedback: vec![item("ghost-session", "entry-9", FeedbackValue::Up, 0)],
+			})
+			.await
+			.unwrap();
+		let entries = store.feedback_export().await.unwrap();
+		assert_eq!(entries.len(), 2);
+		let ghost = entries
+			.iter()
+			.find(|e| e.session_id == "ghost-session")
+			.unwrap();
+		assert_eq!(ghost.log_id, None);
+		assert_eq!(ghost.model, None);
 	}
 }
