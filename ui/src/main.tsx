@@ -30,6 +30,7 @@ import { ProvidersPage } from '@/pages/Providers';
 import { ObservabilitySettingsPage } from '@/pages/settings/ObservabilitySettings';
 import { SettingsLayout, settingsTabs } from '@/pages/settings/Settings';
 import { UiSettingsPage } from '@/pages/settings/UiSettings';
+import { SessionsPage } from '@/pages/Sessions';
 import { TrafficGatewaysPage } from '@/pages/TrafficGateways';
 import { TrafficListenersPage } from '@/pages/TrafficListeners';
 import { TrafficRoutesPage } from '@/pages/TrafficRoutes';
@@ -95,6 +96,12 @@ const logsRoute = createRoute({
 	getParentRoute: () => appRoute,
 	path: '/llm/logs',
 	component: LogsPage
+});
+
+const sessionsRoute = createRoute({
+	getParentRoute: () => appRoute,
+	path: '/llm/sessions',
+	component: SessionsPage
 });
 
 const analyticsRoute = createRoute({
@@ -253,6 +260,7 @@ const router = createRouter({
 			guardrailsRoute,
 			costsRoute,
 			logsRoute,
+			sessionsRoute,
 			analyticsRoute,
 			keysRoute,
 			playgroundRoute,

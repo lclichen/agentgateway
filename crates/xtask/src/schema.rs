@@ -72,10 +72,34 @@ pub fn generate_schema() -> Result<()> {
 				.join(",")
 		);
 		let table = |root: &str| -> Result<String> {
-			let o = std::process::Command::new(format!("{xtask_path}/../../tools/schema-to-md.sh"))
-				.arg(&rule_path)
-				.args(["--argjson", "shared", &shared, "--arg", "root", root])
-				.output()?;
+			let script = format!("{xtask_path}/../../tools/schema-to-md.sh");
+			// Windows cannot execute .sh directly; route through the Git-for-Windows bash
+			// located by `windows_bash` (plain `bash` is the unusable WSL stub). The JSON
+			// payload must go through `bash -c` with single quotes: passing it as a plain
+			// argv element mangles the double quotes on the Windows process boundary.
+			let mut command = if cfg!(target_os = "windows") {
+				let mut command = windows_bash()
+					.ok_or_else(|| anyhow::anyhow!("bash not found; install Git for Windows"))?;
+				let invocation = format!(
+					"{} '{}' --argjson shared '{}' --arg root '{}'",
+					script.replace('\\', "/"),
+					rule_path.replace('\\', "/"),
+					shared,
+					root
+				);
+				command.arg("-c").arg(invocation);
+				command
+			} else {
+				std::process::Command::new(&script)
+			};
+			let o = if cfg!(target_os = "windows") {
+				command.output()?
+			} else {
+				command
+					.arg(&rule_path)
+					.args(["--argjson", "shared", &shared, "--arg", "root", root])
+					.output()?
+			};
 			if !o.stderr.is_empty() {
 				bail!(
 					"schema documentation generation failed: {}",
@@ -103,6 +127,33 @@ pub fn generate_schema() -> Result<()> {
 		file.write_all(readme.as_bytes())?;
 	}
 	Ok(())
+}
+
+/// Locate a usable bash on Windows. Plain `bash` resolves to the WSL launcher in
+/// System32, which cannot run these scripts, so derive bash from the Git installation
+/// found on PATH (git.exe lives at `<root>/cmd` or `<root>/mingw64/bin`).
+fn windows_bash() -> Option<std::process::Command> {
+	let exec_path = std::process::Command::new("git")
+		.arg("--exec-path")
+		.output()
+		.ok()
+		.map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+	let git_root = exec_path
+		.as_deref()
+		.and_then(|exec| std::path::Path::new(exec).ancestors().nth(3))
+		.map(std::path::Path::to_path_buf);
+	let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+	if let Some(root) = git_root {
+		candidates.push(root.join("bin").join("bash.exe"));
+		candidates.push(root.join("usr").join("bin").join("bash.exe"));
+	}
+	if let Ok(shell) = std::env::var("SHELL") {
+		candidates.push(std::path::PathBuf::from(shell));
+	}
+	candidates
+		.into_iter()
+		.find(|candidate| candidate.is_file())
+		.map(std::process::Command::new)
 }
 
 fn dedupe_lines(input: &str) -> String {

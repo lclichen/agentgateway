@@ -61,6 +61,7 @@ struct DatabaseAttributes {
 	json: Box<str>,
 	agentgateway_user: Option<String>,
 	agentgateway_group: Option<String>,
+	agentgateway_session: Option<String>,
 	user_agent_name: Option<String>,
 }
 
@@ -210,6 +211,7 @@ pub(super) fn database_llm_payload(
 fn database_attributes(kv: &[(&str, Option<ValueBag>)]) -> DatabaseAttributes {
 	let mut agentgateway_user = None;
 	let mut agentgateway_group = None;
+	let mut agentgateway_session = None;
 	let mut user_agent_name = None;
 	for (key, value) in kv {
 		let Some(value) = value else {
@@ -221,6 +223,9 @@ fn database_attributes(kv: &[(&str, Option<ValueBag>)]) -> DatabaseAttributes {
 			},
 			"agentgateway.group" => {
 				agentgateway_group = string_attribute(value);
+			},
+			"agentgateway.session" => {
+				agentgateway_session = string_attribute(value);
 			},
 			"user_agent.name" => {
 				user_agent_name = string_attribute(value);
@@ -235,6 +240,7 @@ fn database_attributes(kv: &[(&str, Option<ValueBag>)]) -> DatabaseAttributes {
 		json,
 		agentgateway_user,
 		agentgateway_group,
+		agentgateway_session,
 		user_agent_name,
 	}
 }
@@ -2280,6 +2286,7 @@ impl Drop for DropOnLog {
 						cost: cost.and_then(|cost| cost.total().to_f64()),
 						agentgateway_user: attributes.agentgateway_user,
 						agentgateway_group: attributes.agentgateway_group,
+						agentgateway_session: attributes.agentgateway_session,
 						user_agent_name: attributes.user_agent_name,
 						has_payload: false,
 						attributes_json: attributes.json,

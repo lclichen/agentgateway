@@ -22,6 +22,7 @@ use crate::{
 
 const DEFAULT_UI_USER_ATTRIBUTE: &str = r#"coalesce(apiKey["agentgateway.dev/owner"], apiKey.user, apiKey.name, apiKey.owner, jwt.sub, jwt.email, basicAuth.username, source.identity.namespace + "/" + source.identity.serviceAccount, source.subjectCn, null)"#;
 const DEFAULT_UI_GROUP_ATTRIBUTE: &str = r#"coalesce(apiKey.group, jwt.groups[0], null)"#;
+const DEFAULT_UI_SESSION_ATTRIBUTE: &str = r#"coalesce(request.headers["x-session-id"], request.headers["session_id"], request.headers["x-session-affinity"], null)"#;
 
 #[derive(Default)]
 struct TracingEnvOverrides {
@@ -694,7 +695,9 @@ pub(crate) fn standard_attributes(
 		),
 		(
 			"agentgateway.session".to_string(),
-			"request.agent.session".to_string(),
+			standard_attributes
+				.and_then(|attributes| attributes.session.clone())
+				.unwrap_or_else(|| DEFAULT_UI_SESSION_ATTRIBUTE.to_string()),
 		),
 	];
 
