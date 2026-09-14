@@ -8,14 +8,15 @@ use sqlx::{FromRow, PgPool, Postgres, QueryBuilder, Row};
 use tracing::{error, info, warn};
 
 use super::{
-	ANALYTICS_TOTALS_SELECT, AnalyticsGroup, AnalyticsSummaryRequest, AnalyticsSummaryResponse,
-	AnalyticsTimeBucket, AnalyticsTotals, GenAiEntry, GetRequest, GetResponse, GroupBy,
+	ANALYTICS_TOTALS_SELECT, AnalyticsSummaryRequest, AnalyticsSummaryResponse,
+	AnalyticsTimeBucket, AnalyticsTotals, FeedbackEntry, FeedbackUpsertRequest,
+	FeedbackUpsertResponse, FeedbackValue, GenAiEntry, GetRequest, GetResponse, GroupBy,
 	GroupByField, LogEntry, LogFilters, MIGRATIONS_TABLE, OUTPUT_TOKENS_PER_SECOND_BOUNDS,
 	PayloadEntry, SearchRequest, SearchResponse, SessionSummary, SessionsRequest, SessionsResponse,
 	StoredRequestLog, StoredRequestLogPayload, TTFT_BOUNDS_MS, TailRequest, TailResponse,
 	TimeRange, TurnEntry, UsageEntry, analytics_window, attr_filter_values, decode_cursor,
 	encode_cursor, groups_from_buckets, histogram_bucket_sql, limit,
-	promoted_attribute_column, prompt_preview, turn_kind,
+	promoted_attribute_column, prompt_preview, truncate_snippet, turn_kind,
 };
 
 pub struct PostgresLogStore {
@@ -76,7 +77,7 @@ impl PostgresLogStore {
 		let rows = qb.build().fetch_all(&self.pool).await?;
 		let mut logs = rows
 			.into_iter()
-			.map(|row| row_to_log(row, request.include_attributes, false))
+			.map(|row| row_to_log(row, request.include_attributes, request.include_payload))
 			.collect::<Result<Vec<_>, _>>()?;
 		let next_cursor = if logs.len() > limit as usize {
 			let _ = logs.pop();
@@ -261,6 +262,7 @@ impl PostgresLogStore {
 			 COALESCE(SUM(total_tokens), 0)::BIGINT AS total_tokens, \
 			 COALESCE(SUM(cost), 0.0)::DOUBLE PRECISION AS cost, \
 			 SUM(CASE WHEN http_status >= 400 THEN 1 ELSE 0 END) AS errors, \
+			 MAX(agentgateway_user) AS session_user, \
 			 MIN(id) AS first_log_id, MAX(id) AS last_log_id \
 			 FROM request_logs WHERE agentgateway_session IS NOT NULL AND agentgateway_session != ''",
 		);
@@ -286,6 +288,7 @@ impl PostgresLogStore {
 			total_tokens: i64,
 			cost: f64,
 			errors: i64,
+			user: Option<String>,
 			first_log_id: String,
 			last_log_id: String,
 		}
@@ -299,6 +302,7 @@ impl PostgresLogStore {
 				total_tokens: row.try_get("total_tokens")?,
 				cost: row.try_get("cost")?,
 				errors: row.try_get("errors")?,
+				user: row.try_get("session_user")?,
 				first_log_id: row.try_get("first_log_id")?,
 				last_log_id: row.try_get("last_log_id")?,
 			});
@@ -345,6 +349,7 @@ impl PostgresLogStore {
 				total_tokens: s.total_tokens,
 				cost: s.cost,
 				errors: s.errors,
+				user: s.user,
 				last_log_id: Some(s.last_log_id),
 			})
 			.collect();
@@ -352,6 +357,86 @@ impl PostgresLogStore {
 			sessions,
 			next_cursor,
 		})
+	}
+
+	pub async fn feedback_upsert(
+		&self,
+		request: FeedbackUpsertRequest,
+	) -> anyhow::Result<FeedbackUpsertResponse> {
+		let now = chrono::Utc::now();
+		let mut tx = self.pool.begin().await?;
+		let mut accepted = Vec::with_capacity(request.feedback.len());
+		for item in &request.feedback {
+			let created_at = item
+				.created_at
+				.and_then(chrono::DateTime::from_timestamp_millis)
+				.unwrap_or(now);
+			let aligned: Option<(String, Option<String>)> = sqlx::query_as(
+				"SELECT id, gen_ai_request_model FROM request_logs \
+				 WHERE agentgateway_session = $1 AND completed_at <= $2 \
+				 ORDER BY completed_at DESC, id DESC LIMIT 1",
+			)
+			.bind(&item.session_id)
+			.bind(created_at)
+			.fetch_optional(&mut *tx)
+			.await?;
+			sqlx::query(
+				r#"INSERT INTO message_feedback (
+					session_id, entry_id, value, snippet, client_created_at, server_created_at,
+					username, model, log_id
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				ON CONFLICT(session_id, entry_id) DO UPDATE SET
+					value = excluded.value,
+					snippet = excluded.snippet,
+					client_created_at = excluded.client_created_at,
+					server_created_at = excluded.server_created_at,
+					username = excluded.username,
+					model = excluded.model,
+					log_id = excluded.log_id
+				"#,
+			)
+			.bind(&item.session_id)
+			.bind(&item.entry_id)
+			.bind(item.value.as_str())
+			.bind(truncate_snippet(item.snippet.as_deref()))
+			.bind(item.created_at)
+			.bind(now)
+			.bind(request.user.as_deref())
+			.bind(aligned.as_ref().and_then(|(_, model)| model.clone()))
+			.bind(aligned.as_ref().map(|(log_id, _)| log_id.clone()))
+			.execute(&mut *tx)
+			.await?;
+			accepted.push(format!("{}:{}", item.session_id, item.entry_id));
+		}
+		tx.commit().await?;
+		Ok(FeedbackUpsertResponse { accepted })
+	}
+
+	pub async fn feedback_export(&self) -> anyhow::Result<Vec<FeedbackEntry>> {
+		let rows = sqlx::query(
+			"SELECT session_id, entry_id, value, snippet, client_created_at, server_created_at, \
+			 username, model, log_id \
+			 FROM message_feedback ORDER BY server_created_at ASC, session_id ASC, entry_id ASC",
+		)
+		.fetch_all(&self.pool)
+		.await?;
+		rows
+			.into_iter()
+			.map(|row| {
+				let value: String = row.try_get("value")?;
+				Ok(FeedbackEntry {
+					session_id: row.try_get("session_id")?,
+					entry_id: row.try_get("entry_id")?,
+					value: FeedbackValue::parse(&value)?,
+					snippet: row.try_get("snippet")?,
+					client_created_at: row.try_get("client_created_at")?,
+					server_created_at: row.try_get("server_created_at")?,
+					username: row.try_get("username")?,
+					model: row.try_get("model")?,
+					log_id: row.try_get("log_id")?,
+				})
+			})
+			.collect()
 	}
 }
 
@@ -667,7 +752,7 @@ fn row_to_log(
 		input: turn_kind(request_prompt.as_ref().map(|value| &value.0)),
 		output: turn_kind(response_completion.as_ref().map(|value| &value.0)),
 	};
-	let payload = if include_payload {
+	let payload = if include_payload && (request_prompt.is_some() || response_completion.is_some()) {
 		Some(PayloadEntry {
 			request_prompt: request_prompt.map(|v| v.0),
 			response_completion: response_completion.map(|v| v.0),
