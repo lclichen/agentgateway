@@ -127,6 +127,15 @@ pub async fn tail(request: TailRequest) -> anyhow::Result<TailResponse> {
 	store.request(|tx| LogStoreMsg::Tail { request, tx }).await
 }
 
+pub async fn search_sessions(request: SessionsRequest) -> anyhow::Result<SessionsResponse> {
+	let store = REQUEST_LOG_STORE
+		.get()
+		.ok_or_else(|| anyhow::anyhow!("request log database is not configured"))?;
+	store
+		.request(|tx| LogStoreMsg::SearchSessions { request, tx })
+		.await
+}
+
 pub struct RequestLogStoreGuard {
 	tx: Sender<LogStoreMsg>,
 	writer: Option<thread::JoinHandle<()>>,
@@ -177,6 +186,10 @@ enum LogStoreMsg {
 	Tail {
 		request: TailRequest,
 		tx: QueryResponse<TailResponse>,
+	},
+	SearchSessions {
+		request: SessionsRequest,
+		tx: QueryResponse<SessionsResponse>,
 	},
 	Shutdown,
 }
@@ -351,6 +364,11 @@ async fn process_log_store_msg(
 			let _ = tx.send(backend.tail(request).await);
 			false
 		},
+		LogStoreMsg::SearchSessions { request, tx } => {
+			flush_log_store_batch(backend, batch).await;
+			let _ = tx.send(backend.search_sessions(request).await);
+			false
+		},
 		LogStoreMsg::Shutdown => true,
 	}
 }
@@ -397,6 +415,7 @@ pub struct StoredRequestLog {
 	pub cost: Option<f64>,
 	pub agentgateway_user: Option<String>,
 	pub agentgateway_group: Option<String>,
+	pub agentgateway_session: Option<String>,
 	pub user_agent_name: Option<String>,
 	pub has_payload: bool,
 	pub attributes_json: Box<str>,
@@ -484,6 +503,42 @@ pub struct TailRequest {
 	pub filters: LogFilters,
 	#[serde(default)]
 	pub include_attributes: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionsRequest {
+	#[serde(default)]
+	pub limit: Option<i64>,
+	#[serde(default)]
+	pub cursor: Option<String>,
+	#[serde(default)]
+	pub time_range: Option<TimeRange>,
+	#[serde(default)]
+	pub filters: LogFilters,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSummary {
+	pub session: String,
+	pub started_at: DateTime<Utc>,
+	pub last_seen: DateTime<Utc>,
+	pub requests: i64,
+	pub total_tokens: i64,
+	pub cost: f64,
+	pub errors: i64,
+	/// Preview of the first user prompt seen in this session.
+	pub title: Option<String>,
+	/// Log id of the most recent request in this session.
+	pub last_log_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionsResponse {
+	pub sessions: Vec<SessionSummary>,
+	pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -577,6 +632,8 @@ pub struct LogEntry {
 	pub usage: UsageEntry,
 	pub cost: Option<f64>,
 	pub has_payload: bool,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub session: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub attributes: Option<Value>,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -713,6 +770,7 @@ pub(crate) fn promoted_attribute_column(key: &str) -> Option<&'static str> {
 	match key {
 		"agentgateway.user" => Some("agentgateway_user"),
 		"agentgateway.group" => Some("agentgateway_group"),
+		"agentgateway.session" => Some("agentgateway_session"),
 		"user_agent.name" => Some("user_agent_name"),
 		_ => None,
 	}
@@ -815,6 +873,13 @@ impl Backend {
 		match self {
 			Self::Sqlite(store) => store.tail(request).await,
 			Self::Postgres(store) => store.tail(request).await,
+		}
+	}
+
+	async fn search_sessions(&self, request: SessionsRequest) -> anyhow::Result<SessionsResponse> {
+		match self {
+			Self::Sqlite(store) => store.search_sessions(request).await,
+			Self::Postgres(store) => store.search_sessions(request).await,
 		}
 	}
 }

@@ -6707,3 +6707,70 @@ details summary {
 .link-button:hover {
 	opacity: 0.8;
 }
+
+/* Sessions view */
+.sessions-table .session-title {
+	max-width: 340px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-weight: 500;
+}
+
+.sessions-table .session-id {
+	color: var(--muted);
+	font-family: var(--mono);
+	font-size: 11.5px;
+}
+
+.sessions-table tbody tr {
+	cursor: pointer;
+}
+
+.session-detail-header {
+	display: flex;
+	align-items: center;
+	gap: 14px;
+	padding-bottom: 12px;
+	border-bottom: 1px solid var(--line);
+}
+
+.session-detail-title {
+	display: flex;
+	min-width: 0;
+	flex: 1;
+	flex-direction: column;
+	gap: 2px;
+}
+
+.session-detail-title h3 {
+	display: flex;
+	align-items: center;
+	gap: 7px;
+	margin: 0;
+	font-size: 15px;
+	font-weight: 560;
+	overflow: hidden;
+	white-space: nowrap;
+}
+
+.session-detail-stats {
+	display: flex;
+	gap: 14px;
+	color: var(--muted);
+	font-size: 12.5px;
+	white-space: nowrap;
+}
+
+.session-transcript {
+	margin-top: 16px;
+}
+
+.session-transcript h4 {
+	margin: 0 0 8px;
+	font-size: 13px;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	color: var(--muted);
+}

@@ -808,6 +808,13 @@
             "string",
             "null"
           ]
+        },
+        "session": {
+          "description": "CEL expression used to populate the `agentgateway.session` request log attribute.\nSessions are stored in a dedicated indexed column and power the UI conversation view.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false

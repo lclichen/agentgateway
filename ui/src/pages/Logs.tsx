@@ -1020,7 +1020,7 @@ function analyticsMetricLabel(metric: AnalyticsMetric) {
 	return 'Tokens';
 }
 
-function formatCost(value: number, minimumFractionDigits = 0) {
+export function formatCost(value: number, minimumFractionDigits = 0) {
 	let formatted: string;
 	if (value === 0) formatted = '$0.00';
 	else if (value >= 10) formatted = `$${value.toFixed(2)}`;
@@ -1058,13 +1058,13 @@ function analyticsRecordCost(value: unknown) {
 	return 0;
 }
 
-type RenderedLogMessagePart =
+export type RenderedLogMessagePart =
 	| { type: 'text'; text: string }
 	| { type: 'toolCall'; id?: string; name: string; arguments?: unknown }
 	| { type: 'toolResult'; id?: string; name?: string; content?: unknown; isError?: boolean }
 	| { type: 'reasoning'; content?: unknown };
 
-type RenderedLogMessage = {
+export type RenderedLogMessage = {
 	role: 'system' | 'user' | 'assistant' | 'tool';
 	content: string;
 	name?: string;
@@ -1553,7 +1553,7 @@ function LogDetailView(props: { entry: LogEntry; onOpenSettings?: () => void }) 
 
 type TrajectoryLane = 'input' | 'model' | 'tool-call' | 'tool-result';
 
-type TrajectoryEvent = {
+export type TrajectoryEvent = {
 	lane: TrajectoryLane;
 	label: string;
 	approxTokens: number;
@@ -1648,7 +1648,7 @@ function LogTrajectory(props: { events: TrajectoryEvent[]; onJump: (anchorId: st
 	);
 }
 
-function trajectoryEvents(messages: RenderedLogMessage[]): TrajectoryEvent[] {
+export function trajectoryEvents(messages: RenderedLogMessage[]): TrajectoryEvent[] {
 	const events: Array<Omit<TrajectoryEvent, 'anchorId'>> = [];
 	for (const [messageIndex, message] of messages.entries()) {
 		if (message.parts) {
@@ -1976,7 +1976,7 @@ const LOG_ROLE_LABELS: Record<RenderedLogMessage['role'], string> = {
 	tool: 'Tool'
 };
 
-function LogMessageView(props: { message: RenderedLogMessage; events: TrajectoryEvent[] }) {
+export function LogMessageView(props: { message: RenderedLogMessage; events: TrajectoryEvent[] }) {
 	const message = props.message;
 	const content = message.content;
 	const isSystem = message.role === 'system';
@@ -2314,7 +2314,7 @@ function LogToolBlock(props: {
 	);
 }
 
-function logConversation(entry: LogEntry): RenderedLogMessage[] {
+export function logConversation(entry: LogEntry): RenderedLogMessage[] {
 	const prompt = payloadValue(entry, 'gen_ai.prompt', 'requestPrompt');
 	const completion = payloadValue(entry, 'gen_ai.completion', 'responseCompletion');
 	return [...messagesFromPrompt(prompt), ...messagesFromCompletion(completion)];
@@ -2586,7 +2586,7 @@ function attributeNumber(value: unknown, keys: string[]) {
 	return undefined;
 }
 
-function CopyButton(props: { value: string }) {
+export function CopyButton(props: { value: string }) {
 	const [copied, setCopied] = useState(false);
 	function handleCopy() {
 		void navigator.clipboard.writeText(props.value).then(() => {

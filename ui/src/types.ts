@@ -144,6 +144,7 @@ export interface LogEntry {
 	};
 	cost?: number | null;
 	hasPayload: boolean;
+	session?: string | null;
 	attributes?: unknown;
 	payload?: {
 		requestPrompt?: unknown;
@@ -193,6 +194,30 @@ export interface SearchLogsResponse {
 export interface TailEvent {
 	entry: LogEntry;
 	cursor: string;
+}
+
+export interface SessionsRequest {
+	limit?: number;
+	cursor?: string;
+	timeRange?: TimeRange;
+	filters?: LogFilters;
+}
+
+export interface SessionSummary {
+	session: string;
+	startedAt: string;
+	lastSeen: string;
+	requests: number;
+	totalTokens: number;
+	cost: number;
+	errors: number;
+	title?: string | null;
+	lastLogId?: string | null;
+}
+
+export interface SessionsResponse {
+	sessions: SessionSummary[];
+	nextCursor?: string | null;
 }
 
 export interface AnalyticsGroup {

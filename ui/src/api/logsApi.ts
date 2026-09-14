@@ -5,6 +5,8 @@ import type {
 	LogEntry,
 	SearchLogsRequest,
 	SearchLogsResponse,
+	SessionsRequest,
+	SessionsResponse,
 	TailEvent
 } from '@/types';
 
@@ -24,6 +26,13 @@ export function getLog(id: string) {
 
 export function analyticsSummary(request: AnalyticsSummaryRequest) {
 	return requestJson<AnalyticsSummaryResponse>('/api/logs/analytics/summary', {
+		method: 'POST',
+		body: JSON.stringify(request)
+	});
+}
+
+export function searchSessions(request: SessionsRequest) {
+	return requestJson<SessionsResponse>('/api/logs/sessions', {
 		method: 'POST',
 		body: JSON.stringify(request)
 	});

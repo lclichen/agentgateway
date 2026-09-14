@@ -101,6 +101,7 @@ pub fn router(
 		.route("/api/logs/search", post(search_logs))
 		.route("/api/logs/get", post(get_log))
 		.route("/api/logs/tail", post(tail_logs))
+		.route("/api/logs/sessions", post(search_sessions))
 		.route("/api/logs/analytics/summary", post(analytics_summary))
 		.route("/api/costs/models", get(cost_models))
 		.route("/api/costs/refresh-base", post(refresh_base_costs))
@@ -847,6 +848,15 @@ async fn get_log(
 	Json(request): Json<crate::telemetry::log_store::GetRequest>,
 ) -> Result<Json<crate::telemetry::log_store::GetResponse>, ErrorResponse> {
 	crate::telemetry::log_store::get(request)
+		.await
+		.map(Json)
+		.map_err(ErrorResponse::Anyhow)
+}
+
+async fn search_sessions(
+	Json(request): Json<crate::telemetry::log_store::SessionsRequest>,
+) -> Result<Json<crate::telemetry::log_store::SessionsResponse>, ErrorResponse> {
+	crate::telemetry::log_store::search_sessions(request)
 		.await
 		.map(Json)
 		.map_err(ErrorResponse::Anyhow)

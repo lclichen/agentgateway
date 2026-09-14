@@ -76,6 +76,10 @@ pub struct RawStandardAttributes {
 	/// CEL expression used to populate the `agentgateway.group` request log attribute.
 	#[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
 	pub group: Option<String>,
+	/// CEL expression used to populate the `agentgateway.session` request log attribute.
+	/// Sessions are stored in a dedicated indexed column and power the UI conversation view.
+	#[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+	pub session: Option<String>,
 }
 
 /// Controls which IP address families the DNS resolver will query for
