@@ -33,7 +33,15 @@ pub struct ModelRoute {
 	pub policies: ModelRoutePolicies,
 	#[cfg_attr(feature = "schema", schemars(with = "Vec<serde_json::Value>"))]
 	pub backend_policies: Vec<BackendTrafficPolicy>,
+	/// Static capability/limit metadata surfaced through the model list API.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[cfg_attr(feature = "schema", schemars(with = "Option<serde_json::Value>"))]
+	pub metadata: Option<ModelMetadata>,
 }
+
+/// Static capability/limit metadata declared per model route; served through the model
+/// list API alongside (and overriding) whatever the catalog reports.
+pub use super::model_list::DeclaredMetadata as ModelMetadata;
 
 #[apply(schema_ser_schema!)]
 pub struct ModelRoutePolicies {
@@ -218,6 +226,10 @@ pub struct VirtualModelRoute {
 	#[cfg_attr(feature = "schema", schemars(with = "serde_json::Value"))]
 	pub llm_policy: Arc<llm::Policy>,
 	pub routing: VirtualModelRouting,
+	/// Static capability/limit metadata surfaced through the model list API.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[cfg_attr(feature = "schema", schemars(with = "Option<serde_json::Value>"))]
+	pub metadata: Option<ModelMetadata>,
 }
 
 #[apply(schema_ser_schema!)]
@@ -434,12 +446,16 @@ impl ModelRouter {
 							model_name_matches(&model.name, name) && api_key_model_authorized(req, name)
 						})
 						.map(|(id, name)| {
-							llm::model_list::ModelInfo::new(
+							let mut info = llm::model_list::ModelInfo::new(
 								name.into_owned(),
 								model.created,
 								Some(discovery.provider.clone()),
 								catalog.model(&discovery.provider, id),
-							)
+							);
+							// Config-declared metadata on the wildcard route applies to
+							// every name it expands to.
+							info.declared = model.metadata.clone().unwrap_or_default();
+							info
 						})
 						.collect::<Vec<_>>()
 				} else {
@@ -519,7 +535,10 @@ impl ModelRouter {
 				}
 			})
 			.collect::<Vec<_>>();
-		llm::model_list::ModelInfo::combine(model.name.clone(), model.created, &targets)
+		let mut combined = llm::model_list::ModelInfo::combine(model.name.clone(), model.created, &targets);
+		// Config-declared metadata on the virtual model itself is served verbatim.
+		combined.declared = model.metadata.clone().unwrap_or_default();
+		combined
 	}
 
 	async fn resolve_virtual_model(
@@ -785,14 +804,19 @@ fn model_info(
 	name: String,
 	catalog: &llm::catalog::CatalogSnapshot,
 ) -> llm::model_list::ModelInfo {
-	let Some(discovery) = &route.discovery else {
-		return llm::model_list::ModelInfo::new(name, route.created, None, None);
+	let mut info = match &route.discovery {
+		None => llm::model_list::ModelInfo::new(name, route.created, None, None),
+		Some(discovery) => {
+			let entry = catalog
+				.model_ids(&discovery.provider)
+				.map(|ids| discovery.catalog_model(&name, ids))
+				.and_then(|id| catalog.model(&discovery.provider, &id));
+			llm::model_list::ModelInfo::new(name, route.created, Some(discovery.provider.clone()), entry)
+		},
 	};
-	let entry = catalog
-		.model_ids(&discovery.provider)
-		.map(|ids| discovery.catalog_model(&name, ids))
-		.and_then(|id| catalog.model(&discovery.provider, &id));
-	llm::model_list::ModelInfo::new(name, route.created, Some(discovery.provider.clone()), entry)
+	// Config-declared metadata wins over whatever the catalog reported.
+	info.declared = route.metadata.clone().unwrap_or_default();
+	info
 }
 
 fn is_responses_websocket(req: &Request) -> bool {
@@ -1292,6 +1316,7 @@ mod tests {
 	use super::*;
 	use crate::transport::BufferLimit;
 	use crate::types::agent::RouteBackendTarget;
+	use http_body_util::BodyExt;
 
 	fn original_model(req: &Request) -> Option<&str> {
 		req
@@ -1320,11 +1345,13 @@ mod tests {
 				authorization: None,
 			},
 			backend_policies: vec![],
+			metadata: None,
 		};
 		let router = ModelRouter::new(
 			vec![model("economy-model"), model("premium-model")],
 			vec![VirtualModelRoute {
 				name: "smart-model".to_string(),
+				metadata: None,
 				created: 0,
 				llm_policy: Arc::default(),
 				routing: VirtualModelRouting::Conditional(vec![
@@ -1417,10 +1444,12 @@ mod tests {
 				authorization: None,
 			},
 			backend_policies: vec![],
+			metadata: None,
 		};
 		let callout = |name: &str, config: Value| VirtualModelRoute {
 			name: name.to_string(),
 			created: 0,
+			metadata: None,
 			llm_policy: Arc::default(),
 			routing: VirtualModelRouting::Callout(Arc::new(
 				serde_json::from_value::<llm::router_callout::VirtualModelCallout>(config)
@@ -1620,6 +1649,7 @@ mod tests {
 			vec![],
 			vec![VirtualModelRoute {
 				name: "weighted-model".to_string(),
+				metadata: None,
 				created: 0,
 				llm_policy: Arc::default(),
 				routing: VirtualModelRouting::Weighted(vec![WeightedTarget {
@@ -1658,6 +1688,7 @@ mod tests {
 			vec![],
 			vec![VirtualModelRoute {
 				name: "conditional-model".to_string(),
+				metadata: None,
 				created: 0,
 				llm_policy: Arc::default(),
 				routing: VirtualModelRouting::Conditional(vec![
@@ -1732,6 +1763,7 @@ mod tests {
 				authorization: Some(authorization),
 			},
 			backend_policies: vec![],
+			metadata: None,
 		};
 
 		let allowed = ::http::Request::builder()
@@ -2291,5 +2323,82 @@ mod tests {
 		] {
 			assert_eq!(classify_route(path), None, "{path}");
 		}
+	}
+
+	#[tokio::test]
+	async fn model_list_includes_configured_metadata() {
+		let model = ModelRoute {
+			id: None,
+			name: "gpt-5-mini".to_string(),
+			created: 0,
+			discovery: None,
+			visibility: ModelVisibility::Public,
+			header_matches: vec![],
+			backend: RouteBackendReference {
+				weight: 1,
+				target: RouteBackendTarget::Invalid,
+				inline_policies: vec![],
+			},
+			policies: ModelRoutePolicies {
+				passthrough: None,
+				llm: Arc::default(),
+				authorization: None,
+			},
+			backend_policies: vec![],
+			metadata: Some(ModelMetadata {
+				context_length: Some(131072),
+				max_output_tokens: Some(16384),
+				input_modalities: Some(vec!["text".to_string(), "image".to_string()]),
+				output_modalities: Some(vec!["text".to_string()]),
+			}),
+		};
+		let virtual_model = VirtualModelRoute {
+			name: "smart-model".to_string(),
+			created: 0,
+			metadata: Some(ModelMetadata {
+				context_length: Some(4096),
+				..Default::default()
+			}),
+			llm_policy: Arc::default(),
+			routing: VirtualModelRouting::Conditional(vec![ConditionalTarget {
+				model: "gpt-5-mini".to_string(),
+				invalid: false,
+				when: None,
+			}]),
+		};
+		let router = ModelRouter::new(vec![model], vec![virtual_model]);
+		let mut req = ::http::Request::builder()
+			.uri("http://example.com/v1/models")
+			.body(http::Body::empty())
+			.expect("valid request");
+
+		let ResolveResult::DirectResponse(resp) = router
+			.resolve(
+				&mut req,
+				&llm::catalog::ModelCatalog::default(),
+				&crate::test_helpers::policy_client(),
+			)
+			.await
+		else {
+			panic!("expected direct model list response")
+		};
+		let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		let entries = json["data"].as_array().expect("model list data");
+		let gpt = entries
+			.iter()
+			.find(|e| e["id"] == "gpt-5-mini")
+			.expect("gpt entry");
+		assert_eq!(gpt["context_length"], 131072);
+		assert_eq!(gpt["max_output_tokens"], 16384);
+		assert_eq!(gpt["input_modalities"][0], "text");
+		assert_eq!(gpt["input_modalities"][1], "image");
+		assert_eq!(gpt["output_modalities"][0], "text");
+		let smart = entries
+			.iter()
+			.find(|e| e["id"] == "smart-model")
+			.expect("virtual entry");
+		assert_eq!(smart["context_length"], 4096);
+		assert!(smart.get("max_output_tokens").is_none());
 	}
 }
