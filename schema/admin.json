@@ -936,6 +936,9 @@
         "backendPolicies": {
           "type": "array",
           "items": true
+        },
+        "metadata": {
+          "description": "Static capability/limit metadata surfaced through the model list API."
         }
       },
       "additionalProperties": false,
@@ -977,6 +980,9 @@
         "llmPolicy": true,
         "routing": {
           "$ref": "#/$defs/VirtualModelRouting"
+        },
+        "metadata": {
+          "description": "Static capability/limit metadata surfaced through the model list API."
         }
       },
       "additionalProperties": false,

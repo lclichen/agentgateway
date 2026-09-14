@@ -510,6 +510,9 @@ pub struct LocalLLMVirtualModel {
 	name: String,
 	/// routing selects an existing LLM model backend for each request.
 	routing: LocalLLMVirtualModelRouting,
+	/// metadata advertises static model capabilities/limits through the model list API.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	metadata: Option<LocalLLMModelMetadata>,
 }
 
 #[apply(schema_de!)]
@@ -780,6 +783,42 @@ impl LocalRateLimitPolicy {
 	}
 }
 
+/// Static capability/limit metadata advertised for a model through the model list API
+/// (`/v1/models`), so clients can render context windows and modalities without
+/// hard-coding them. All fields are optional; omitted fields are omitted from the API.
+/// Fields are served under their snake_case names (`context_length`,
+/// `max_output_tokens`, `input_modalities`, `output_modalities`) on `/v1/models`
+/// entries. Metadata on a wildcard model name applies to every name it expands to.
+#[apply(schema_de!)]
+#[derive(Default)]
+pub struct LocalLLMModelMetadata {
+	/// Maximum total context length (prompt + completion tokens) the model accepts.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+	context_length: Option<i64>,
+	/// Maximum completion (output) tokens per request.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+	max_output_tokens: Option<i64>,
+	/// Input modalities the model accepts, e.g. ["text", "image"].
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	input_modalities: Option<Vec<String>>,
+	/// Output modalities the model produces, e.g. ["text"].
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	output_modalities: Option<Vec<String>>,
+}
+
+impl From<LocalLLMModelMetadata> for llm::model_router::ModelMetadata {
+	fn from(metadata: LocalLLMModelMetadata) -> Self {
+		Self {
+			context_length: metadata.context_length,
+			max_output_tokens: metadata.max_output_tokens,
+			input_modalities: metadata.input_modalities,
+			output_modalities: metadata.output_modalities,
+		}
+	}
+}
+
 #[apply(schema_de!)]
 pub struct LocalLLMModels {
 	/// id is a stable identity for this model config entry. The name field remains the model match pattern.
@@ -799,6 +838,9 @@ pub struct LocalLLMModels {
 	params: LocalLLMParams,
 	/// provider of the LLM we are connecting too
 	provider: LocalModelAIProvider,
+	/// metadata advertises static model capabilities/limits through the model list API.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	metadata: Option<LocalLLMModelMetadata>,
 	/// passthrough controls how requests are handled.
 	/// By default, requests will be parsed and translated as needed.
 	/// With passthrough, they will be unmodified and optionally inspected (with `detect`).
@@ -4615,6 +4657,7 @@ async fn convert_llm_config(
 				authorization: model_config.authorization.clone(),
 			},
 			backend_policies: vec![],
+			metadata: model_config.metadata.clone().map(Into::into),
 		});
 	}
 
@@ -4704,6 +4747,7 @@ async fn convert_llm_config(
 			created: startup_timestamp,
 			llm_policy,
 			routing,
+			metadata: virtual_model.metadata.clone().map(Into::into),
 		});
 	}
 

@@ -71164,6 +71164,11 @@
 |`llm.models[].provider.custom.formats`|[]object|Supported API payload formats and optional path overrides for this provider.|
 |`llm.models[].provider.custom.formats[].type`|enum|Upstream API shape this custom provider says it accepts.<br>Possible values: `completions`, `messages`, `responses`, `embeddings`, `anthropicTokenCount`, `generateContent`, `geminiCountTokens`, `realtime`, `rerank`.|
 |`llm.models[].provider.custom.formats[].path`|string|Optional path override for this specific upstream format.|
+|`llm.models[].metadata`|object|metadata advertises static model capabilities/limits through the model list API.|
+|`llm.models[].metadata.contextLength`|integer|Maximum total context length (prompt + completion tokens) the model accepts.|
+|`llm.models[].metadata.maxOutputTokens`|integer|Maximum completion (output) tokens per request.|
+|`llm.models[].metadata.inputModalities`|[]string|Input modalities the model accepts, e.g. ["text", "image"].|
+|`llm.models[].metadata.outputModalities`|[]string|Output modalities the model produces, e.g. ["text"].|
 |`llm.models[].passthrough`|enum|passthrough controls how requests are handled.<br>By default, requests will be parsed and translated as needed.<br>With passthrough, they will be unmodified and optionally inspected (with `detect`).<br>In this mode, requests must be sent in the native format of the provider.<br>Possible values: `detect`, `opaque`.|
 |`llm.models[].authorization`|object|authorization configures HTTP authorization rules for requests to this model.|
 |`llm.models[].authorization.rules`|[]object|CEL authorization rules to evaluate for a request.|
@@ -73901,6 +73906,11 @@
 |`llm.virtualModels[].routing.conditional.targets`|[]object|targets are evaluated in order. The first matching condition selects the model.|
 |`llm.virtualModels[].routing.conditional.targets[].when`|string|when must evaluate to true for this target to be selected. Omit only on the final fallback target.|
 |`llm.virtualModels[].routing.conditional.targets[].model`|string|model is resolved against llm.models using the same wildcard matching as client requests.|
+|`llm.virtualModels[].metadata`|object|metadata advertises static model capabilities/limits through the model list API.|
+|`llm.virtualModels[].metadata.contextLength`|integer|Maximum total context length (prompt + completion tokens) the model accepts.|
+|`llm.virtualModels[].metadata.maxOutputTokens`|integer|Maximum completion (output) tokens per request.|
+|`llm.virtualModels[].metadata.inputModalities`|[]string|Input modalities the model accepts, e.g. ["text", "image"].|
+|`llm.virtualModels[].metadata.outputModalities`|[]string|Output modalities the model produces, e.g. ["text"].|
 |`llm.policies`|object|policies defines policies for handling incoming requests, before a model is selected|
 |`llm.policies.oidc`|object|Authenticate browser requests with OIDC authorization code flow.|
 |`llm.policies.oidc.issuer`|string|Issuer used for discovery and ID token validation.|

@@ -28,6 +28,42 @@ pub struct ModelRoute {
 	pub policies: ModelRoutePolicies,
 	#[cfg_attr(feature = "schema", schemars(with = "Vec<serde_json::Value>"))]
 	pub backend_policies: Vec<BackendTrafficPolicy>,
+	/// Static capability/limit metadata surfaced through the model list API.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[cfg_attr(feature = "schema", schemars(with = "Option<serde_json::Value>"))]
+	pub metadata: Option<ModelMetadata>,
+}
+
+/// Static capability/limit metadata for a model, served as extra fields on model list
+/// entries so clients can render context windows and modalities without hard-coding them.
+#[derive(Clone, Debug, Default, ::serde::Serialize)]
+pub struct ModelMetadata {
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub context_length: Option<i64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub max_output_tokens: Option<i64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub input_modalities: Option<Vec<String>>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub output_modalities: Option<Vec<String>>,
+}
+
+impl ModelMetadata {
+	fn merge_into(&self, entry: &mut serde_json::Map<String, Value>) {
+		fn insert<T: Into<Value>>(
+			entry: &mut serde_json::Map<String, Value>,
+			key: &str,
+			value: Option<T>,
+		) {
+			if let Some(value) = value {
+				entry.insert(key.to_string(), value.into());
+			}
+		}
+		insert(entry, "context_length", self.context_length);
+		insert(entry, "max_output_tokens", self.max_output_tokens);
+		insert(entry, "input_modalities", self.input_modalities.clone());
+		insert(entry, "output_modalities", self.output_modalities.clone());
+	}
 }
 
 #[apply(schema_ser_schema!)]
@@ -101,6 +137,10 @@ pub struct VirtualModelRoute {
 	#[cfg_attr(feature = "schema", schemars(with = "serde_json::Value"))]
 	pub llm_policy: Arc<llm::Policy>,
 	pub routing: VirtualModelRouting,
+	/// Static capability/limit metadata surfaced through the model list API.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[cfg_attr(feature = "schema", schemars(with = "Option<serde_json::Value>"))]
+	pub metadata: Option<ModelMetadata>,
 }
 
 #[apply(schema_ser_schema!)]
@@ -225,14 +265,14 @@ impl ModelRouter {
 			.filter(|model| model_authorized(model, req))
 			.flat_map(|model| {
 				api_key_discoverable_models(req, &model.name)
-					.map(|name| model_list_entry(name, model.created))
+					.map(|name| model_list_entry(name, model.created, model.metadata.as_ref()))
 			})
 			.chain(
 				self
 					.virtual_models
 					.iter()
 					.filter(|model| api_key_model_authorized(req, &model.name))
-					.map(|model| model_list_entry(&model.name, model.created)),
+					.map(|model| model_list_entry(&model.name, model.created, model.metadata.as_ref())),
 			)
 			.collect::<Vec<_>>();
 		let body = serde_json::json!({
@@ -461,14 +501,22 @@ fn api_key_discoverable_models<'a>(
 	)
 }
 
-fn model_list_entry(id: &str, created: u64) -> serde_json::Value {
-	serde_json::json!({
+fn model_list_entry(id: &str, created: u64, metadata: Option<&ModelMetadata>) -> serde_json::Value {
+	let mut entry = serde_json::json!({
 		"id": id,
 		"object": "model",
 		"created": created,
 		// TODO: this matches some other gateways but seems odd. Should we use the real provide here?
 		"owned_by": "openai",
-	})
+	});
+	if let Some(metadata) = metadata {
+		metadata.merge_into(
+			entry
+				.as_object_mut()
+				.expect("model list entry is an object"),
+		);
+	}
+	entry
 }
 
 fn is_model_list_request(req: &Request) -> bool {
@@ -897,6 +945,7 @@ mod tests {
 	use super::*;
 	use crate::transport::BufferLimit;
 	use crate::types::agent::RouteBackendTarget;
+	use http_body_util::BodyExt;
 
 	#[tokio::test]
 	async fn conditional_virtual_model_can_use_llm_request() {
@@ -916,11 +965,13 @@ mod tests {
 				authorization: None,
 			},
 			backend_policies: vec![],
+			metadata: None,
 		};
 		let router = ModelRouter::new(
 			vec![model("economy-model"), model("premium-model")],
 			vec![VirtualModelRoute {
 				name: "smart-model".to_string(),
+				metadata: None,
 				created: 0,
 				llm_policy: default_route_types(),
 				routing: VirtualModelRouting::Conditional(vec![
@@ -964,6 +1015,7 @@ mod tests {
 			vec![],
 			vec![VirtualModelRoute {
 				name: "weighted-model".to_string(),
+				metadata: None,
 				created: 0,
 				llm_policy: default_route_types(),
 				routing: VirtualModelRouting::Weighted(vec![WeightedTarget {
@@ -995,6 +1047,7 @@ mod tests {
 			vec![],
 			vec![VirtualModelRoute {
 				name: "conditional-model".to_string(),
+				metadata: None,
 				created: 0,
 				llm_policy: default_route_types(),
 				routing: VirtualModelRouting::Conditional(vec![
@@ -1059,6 +1112,7 @@ mod tests {
 				authorization: Some(authorization),
 			},
 			backend_policies: vec![],
+			metadata: None,
 		};
 
 		let allowed = ::http::Request::builder()
@@ -1613,5 +1667,73 @@ mod tests {
 			policy.resolve_route("/v1/anything/else"),
 			llm::RouteType::Passthrough
 		);
+	}
+
+	#[tokio::test]
+	async fn model_list_includes_configured_metadata() {
+		let model = ModelRoute {
+			id: None,
+			name: "gpt-5-mini".to_string(),
+			created: 0,
+			visibility: ModelVisibility::Public,
+			header_matches: vec![],
+			backend: RouteBackendReference {
+				weight: 1,
+				target: RouteBackendTarget::Invalid,
+				inline_policies: vec![],
+			},
+			policies: ModelRoutePolicies {
+				llm: default_route_types(),
+				authorization: None,
+			},
+			backend_policies: vec![],
+			metadata: Some(ModelMetadata {
+				context_length: Some(131072),
+				max_output_tokens: Some(16384),
+				input_modalities: Some(vec!["text".to_string(), "image".to_string()]),
+				output_modalities: Some(vec!["text".to_string()]),
+			}),
+		};
+		let virtual_model = VirtualModelRoute {
+			name: "smart-model".to_string(),
+			created: 0,
+			metadata: Some(ModelMetadata {
+				context_length: Some(4096),
+				..Default::default()
+			}),
+			llm_policy: default_route_types(),
+			routing: VirtualModelRouting::Conditional(vec![ConditionalTarget {
+				model: "gpt-5-mini".to_string(),
+				invalid: false,
+				when: None,
+			}]),
+		};
+		let router = ModelRouter::new(vec![model], vec![virtual_model]);
+		let mut req = ::http::Request::builder()
+			.uri("http://example.com/v1/models")
+			.body(http::Body::empty())
+			.expect("valid request");
+
+		let ResolveResult::DirectResponse(resp) = router.resolve(&mut req).await else {
+			panic!("expected direct model list response")
+		};
+		let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		let entries = json["data"].as_array().expect("model list data");
+		let gpt = entries
+			.iter()
+			.find(|e| e["id"] == "gpt-5-mini")
+			.expect("gpt entry");
+		assert_eq!(gpt["context_length"], 131072);
+		assert_eq!(gpt["max_output_tokens"], 16384);
+		assert_eq!(gpt["input_modalities"][0], "text");
+		assert_eq!(gpt["input_modalities"][1], "image");
+		assert_eq!(gpt["output_modalities"][0], "text");
+		let smart = entries
+			.iter()
+			.find(|e| e["id"] == "smart-model")
+			.expect("virtual entry");
+		assert_eq!(smart["context_length"], 4096);
+		assert!(smart.get("max_output_tokens").is_none());
 	}
 }

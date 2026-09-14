@@ -12029,6 +12029,17 @@
           "description": "provider of the LLM we are connecting too",
           "$ref": "#/$defs/LocalModelAIProvider"
         },
+        "metadata": {
+          "description": "metadata advertises static model capabilities/limits through the model list API.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalLLMModelMetadata"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "passthrough": {
           "description": "passthrough controls how requests are handled.\nBy default, requests will be parsed and translated as needed.\nWith passthrough, they will be unmodified and optionally inspected (with `detect`).\nIn this mode, requests must be sent in the native format of the provider.",
           "anyOf": [
@@ -12227,6 +12238,51 @@
         }
       ]
     },
+    "LocalLLMModelMetadata": {
+      "description": "Static capability/limit metadata advertised for a model through the model list API\n(`/v1/models`), so clients can render context windows and modalities without\nhard-coding them. All fields are optional; omitted fields are omitted from the API.",
+      "type": "object",
+      "properties": {
+        "contextLength": {
+          "description": "Maximum total context length (prompt + completion tokens) the model accepts.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "minimum": 1
+        },
+        "maxOutputTokens": {
+          "description": "Maximum completion (output) tokens per request.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "minimum": 1
+        },
+        "inputModalities": {
+          "description": "Input modalities the model accepts, e.g. [\"text\", \"image\"].",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "outputModalities": {
+          "description": "Output modalities the model produces, e.g. [\"text\"].",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
     "LocalLLMPassthrough": {
       "oneOf": [
         {
@@ -12264,6 +12320,17 @@
         "routing": {
           "description": "routing selects an existing LLM model backend for each request.",
           "$ref": "#/$defs/LocalLLMVirtualModelRouting"
+        },
+        "metadata": {
+          "description": "metadata advertises static model capabilities/limits through the model list API.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalLLMModelMetadata"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
