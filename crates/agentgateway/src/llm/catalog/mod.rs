@@ -179,9 +179,24 @@ impl ModelCatalog {
 	pub fn as_handle(&self) -> &dyn agent_llm::model_catalog::ModelCatalogHandle {
 		self
 	}
+
+	/// Build a catalog from a JSON string for tests in other modules.
+	#[cfg(test)]
+	pub(crate) fn from_json(json: &str) -> Self {
+		Self {
+			state: ArcSwap::from_pointee(ModelCatalogState {
+				snapshot: Arc::new(CatalogSnapshot::parse(json).unwrap()),
+				sources: Vec::new(),
+			}),
+			file_watch: Mutex::new(None),
+		}
+	}
 }
 
 impl agent_llm::model_catalog::ModelCatalogHandle for ModelCatalog {
+	fn model_has_tag(&self, model_id: &str, tag: &str) -> bool {
+		self.state.load().snapshot.model_has_tag(model_id, tag)
+	}
 	fn get_model_tags(&self, model_id: &str) -> Option<Arc<std::collections::BTreeSet<String>>> {
 		self.state.load().snapshot.get_model_tags(model_id)
 	}
@@ -205,6 +220,13 @@ impl CatalogSnapshot {
 	#[cfg(test)]
 	pub fn parse(json: &str) -> anyhow::Result<Self> {
 		Ok(Self::from_catalogs([model::from_json(json)?]))
+	}
+
+	fn model_has_tag(&self, model_id: &str, tag: &str) -> bool {
+		self
+			.model_tags
+			.get(model_id)
+			.is_some_and(|t| t.contains(tag))
 	}
 
 	fn get_model_tags(&self, model_id: &str) -> Option<Arc<std::collections::BTreeSet<String>>> {

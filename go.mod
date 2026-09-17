@@ -4,6 +4,8 @@ go 1.27.0
 
 replace github.com/agentgateway/agentgateway/api => ./api
 
+replace sigs.k8s.io/gateway-api-inference-extension/conformance => github.com/howardjohn/gateway-api-inference-extension/conformance v0.0.0-20260915181035-7c1a8983fcc6
+
 require (
 	github.com/Masterminds/semver/v3 v3.5.0
 	github.com/agentgateway/agentgateway/api v0.0.0
@@ -59,13 +61,11 @@ require (
 	sigs.k8s.io/controller-runtime v0.24.1
 	sigs.k8s.io/controller-tools v0.22.0
 	sigs.k8s.io/gateway-api v1.6.1
-	sigs.k8s.io/gateway-api-inference-extension v1.5.0
-	sigs.k8s.io/gateway-api-inference-extension/conformance v1.5.0
+	sigs.k8s.io/gateway-api-inference-extension v1.6.1
+	sigs.k8s.io/gateway-api-inference-extension/conformance v1.6.1
 	sigs.k8s.io/gateway-api/conformance v1.6.1
 	sigs.k8s.io/yaml v1.6.0
 )
-
-replace sigs.k8s.io/gateway-api-inference-extension/conformance => github.com/howardjohn/gateway-api-inference-extension/conformance v0.0.0-20260610234253-d7447d7420de
 
 require (
 	cel.dev/expr v0.25.2 // indirect

@@ -2,10 +2,20 @@ pub mod bedrock;
 pub mod completions;
 pub mod gemini;
 pub mod messages;
+pub mod namespace_tools;
 pub mod openai_compat;
 pub mod responses;
 pub mod vertex;
 pub mod vertex_gemini;
+
+pub(crate) fn supports_prompt_cache_breakpoint(model: &str) -> bool {
+	model
+		.strip_prefix("gpt-")
+		.and_then(|model| model.split('-').next())
+		.and_then(|version| version.split_once('.'))
+		.and_then(|(major, minor)| Some((major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?)))
+		.is_some_and(|version| version >= (5, 6))
+}
 
 /// Translate an OpenAI `tool_calls[].function.arguments` string into an Anthropic
 /// `tool_use.input` value.

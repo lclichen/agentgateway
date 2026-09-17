@@ -1231,6 +1231,9 @@ pub mod typed {
 		pub description: Option<String>,
 		/// JSON schema for tool input
 		pub input_schema: serde_json::Value,
+		/// Enforce the tool input schema strictly.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		pub strict: Option<bool>,
 		/// Create a cache control breakpoint at this content block
 		#[serde(skip_serializing_if = "Option::is_none")]
 		pub cache_control: Option<CacheControlEphemeral>,
