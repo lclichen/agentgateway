@@ -1244,6 +1244,7 @@ mod tests {
 				crate::config::standard_attributes(Some(&crate::RawStandardAttributes {
 					user: expression.map(str::to_owned),
 					group: None,
+					session: None,
 				}))
 				.unwrap(),
 			));

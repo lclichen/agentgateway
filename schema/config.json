@@ -12500,7 +12500,7 @@
       ]
     },
     "LocalLLMModelMetadata": {
-      "description": "Static capability/limit metadata advertised for a model through the model list API\n(`/v1/models`), so clients can render context windows and modalities without\nhard-coding them. All fields are optional; omitted fields are omitted from the API.",
+      "description": "Static capability/limit metadata advertised for a model through the model list API\n(`/v1/models`), so clients can render context windows and modalities without\nhard-coding them. All fields are optional; omitted fields are omitted from the API.\nFields are served under their snake_case names (`context_length`,\n`max_output_tokens`, `input_modalities`, `output_modalities`) on `/v1/models`\nentries. Metadata on a wildcard model name applies to every name it expands to.",
       "type": "object",
       "properties": {
         "contextLength": {
