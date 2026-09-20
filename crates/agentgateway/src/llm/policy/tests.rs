@@ -94,10 +94,17 @@ async fn audit_mode_records_allow_when_nothing_matches() {
 		content: "nothing sensitive here".to_string(),
 	};
 	let headers = ::http::HeaderMap::new();
-	let (action, rejection) =
-		Policy::apply_single_response_guard(&guard, &mut resp, &headers, &client, None, None, true)
-			.await
-			.unwrap();
+	let (action, rejection) = Policy::apply_single_response_guard(
+		&guard,
+		&mut resp,
+		&headers,
+		&client,
+		None,
+		None,
+		Some(&mut false),
+	)
+	.await
+	.unwrap();
 	assert!(rejection.is_none(), "audit mode must never reject");
 	Policy::record_guardrail_trip(&client, GuardrailPhase::Response, action);
 
@@ -130,10 +137,17 @@ async fn audit_mode_records_audit_and_passes_through_on_match() {
 		content: original.clone(),
 	};
 	let headers = ::http::HeaderMap::new();
-	let (action, rejection) =
-		Policy::apply_single_response_guard(&guard, &mut resp, &headers, &client, None, None, true)
-			.await
-			.unwrap();
+	let (action, rejection) = Policy::apply_single_response_guard(
+		&guard,
+		&mut resp,
+		&headers,
+		&client,
+		None,
+		None,
+		Some(&mut false),
+	)
+	.await
+	.unwrap();
 	assert_eq!(
 		action,
 		GuardrailAction::Audit,

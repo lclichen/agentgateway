@@ -14,8 +14,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/google/cel-go/cel"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 	"istio.io/istio/pkg/config"
@@ -70,8 +72,14 @@ var logger = logging.New("agentgateway/plugins")
 // Shared CEL environment for expression validation
 var celEnv *cel.Env
 
+var celValidationCache *lru.Cache[uint64, bool]
+
 func init() {
 	var err error
+	celValidationCache, err = lru.New[uint64, bool](1024)
+	if err != nil {
+		panic(err)
+	}
 	celEnv, err = cel.NewEnv()
 	if err != nil {
 		logger.Error("failed to create CEL environment", "error", err)
@@ -2114,8 +2122,14 @@ func convertTransformSpec(spec *agentgateway.Transform) (*api.TrafficPolicySpec_
 
 // Checks if the expression is a valid CEL expression
 func isCEL(expr agentgateway.CELExpression) bool {
+	key := xxhash.Sum64String(string(expr))
+	if valid, found := celValidationCache.Get(key); found {
+		return valid
+	}
 	_, iss := celEnv.Parse(string(expr))
-	return iss.Err() == nil
+	valid := iss.Err() == nil
+	celValidationCache.Add(key, valid)
+	return valid
 }
 
 func attachmentName(target *api.PolicyTarget) string {

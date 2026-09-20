@@ -700,6 +700,17 @@
               "type": "null"
             }
           ]
+        },
+        "perPage": {
+          "description": "Cost per page, for document/OCR models.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Money"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false
@@ -2881,7 +2892,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "response": {
           "description": "Transform the response before it is returned.",
@@ -2892,7 +2904,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         }
       },
       "additionalProperties": false
@@ -2905,48 +2918,42 @@
           "type": "object",
           "additionalProperties": {
             "type": "string"
-          },
-          "default": {}
+          }
         },
         "set": {
           "description": "Headers to set using CEL expressions for values.",
           "type": "object",
           "additionalProperties": {
             "type": "string"
-          },
-          "default": {}
+          }
         },
         "remove": {
           "description": "Header names to remove.",
           "type": "array",
           "items": {
             "type": "string"
-          },
-          "default": []
+          }
         },
         "replace": {
           "description": "CEL expression that computes the full set of headers, replacing all existing headers.\nThe expression must evaluate to a map of header name to value (a string, or a list of\nstrings for a repeated header). Pseudo-headers (`:method`, `:path`, etc.) are ignored;\nset those explicitly with `set`/`add`. `replace` is applied before `add`/`set`/`remove`,\nso those still operate on top of the replaced headers.",
           "type": [
             "string",
             "null"
-          ],
-          "default": null
+          ]
         },
         "body": {
           "description": "CEL expression that computes a replacement body.",
           "type": [
             "string",
             "null"
-          ],
-          "default": null
+          ]
         },
         "metadata": {
           "description": "Metadata values to add using CEL expressions.",
           "type": "object",
           "additionalProperties": {
             "type": "string"
-          },
-          "default": {}
+          }
         }
       },
       "additionalProperties": false
@@ -7891,7 +7898,7 @@
           ]
         },
         "credentialProviders": {
-          "description": "Credential providers available to secret-backed egress effects, keyed by\nthe authority in a `substrate-secret://` URI.",
+          "description": "Credential providers available to secret-backed egress effects, keyed by\nthe authority in an `ate-secret://` URI.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/CredentialProvider"
@@ -8026,7 +8033,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "response": {
           "description": "Transform the response before it is returned.",
@@ -8037,7 +8045,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         }
       }
     },
@@ -12009,7 +12018,7 @@
           ]
         },
         "baseUrl": {
-          "description": "Base URL for the upstream provider. Expands to hostOverride, pathPrefix, and tls for https URLs.\nThe URL path is the upstream base path and defaults to / when omitted.\nProvider-specific endpoint paths are appended to this base path.\nFor example, https://api.openai.com/v1 sends completions to /v1/chat/completions,\nwhile https://api.openai.com sends them to /chat/completions.",
+          "description": "Base URL for the upstream provider. Expands to hostOverride, pathPrefix, and tls for https URLs.\nThe URL path is the upstream base path and defaults to / when omitted.\nProvider-specific endpoint paths are appended to this base path.\nFor example, `https://api.openai.com/v1` sends completions to `/v1/chat/completions`,\nwhile `https://api.openai.com` sends them to `/chat/completions`.",
           "type": [
             "string",
             "null"

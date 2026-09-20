@@ -588,7 +588,7 @@ impl Handler {
 		let res = match request.request {
 			ClientRequest::InitializeRequest(_) => Messages::from_result(
 				id,
-				ServerInfo::new(ServerCapabilities::builder().enable_tools().build()),
+				ServerConfig::new(ServerCapabilities::builder().enable_tools().build()),
 			),
 			ClientRequest::GetPromptRequest(_) => Messages::from_result(id, GetPromptResult::new(vec![])),
 			ClientRequest::ListPromptsRequest(_) => Messages::from_result(

@@ -18,7 +18,6 @@ import (
 	"istio.io/istio/pkg/test/util/file"
 	corev1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	inf "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gwv1b1 "sigs.k8s.io/gateway-api/apis/v1beta1"
@@ -35,7 +34,6 @@ import (
 	"github.com/agentgateway/agentgateway/controller/pkg/apiclient/fake"
 	"github.com/agentgateway/agentgateway/controller/pkg/controller"
 	"github.com/agentgateway/agentgateway/controller/pkg/pluginsdk/krtutil"
-	"github.com/agentgateway/agentgateway/controller/pkg/schemes"
 	"github.com/agentgateway/agentgateway/controller/pkg/syncer"
 	"github.com/agentgateway/agentgateway/controller/pkg/syncer/status"
 	"github.com/agentgateway/agentgateway/controller/pkg/wellknown"
@@ -80,11 +78,6 @@ func isSpace(r rune) bool {
 		}
 	}
 	return false
-}
-
-func init() {
-	// Add our types to Istio since we are using their library
-	utilruntime.Must(schemes.AddToScheme(kube.IstioScheme))
 }
 
 func GetTestResource[T any](t *testing.T, collection krt.Collection[T]) T {
@@ -155,10 +148,20 @@ type testOutput[Status any, Output any] struct {
 }
 
 func Syncer(t *testing.T, ctx plugins.PolicyCtx, includeStatusKinds ...string) (*TestStatusQueue, *syncer.Syncer) {
+	return SyncerWithOptions(t, ctx, includeStatusKinds)
+}
+
+// SyncerWithOptions is Syncer, with syncer options applied.
+func SyncerWithOptions(
+	t *testing.T,
+	ctx plugins.PolicyCtx,
+	includeStatusKinds []string,
+	opts ...syncer.AgentgatewaySyncerOption,
+) (*TestStatusQueue, *syncer.Syncer) {
 	fc := fake.NewClient(t)
 	stop := test.NewStop(t)
 	debugger := new(krt.DebugHandler)
-	opts := krtutil.NewKrtOptions(stop, debugger)
+	krtOpts := krtutil.NewKrtOptions(stop, debugger)
 	resolver := BuildRemoteHTTPResolver(ctx.Collections)
 	jwksLookup := BuildJWKSLookup(ctx.Collections)
 	t.Cleanup(func() {
@@ -174,8 +177,9 @@ func Syncer(t *testing.T, ctx plugins.PolicyCtx, includeStatusKinds ...string) (
 		ctx.Collections,
 		agwPluginFactory(ctx.Collections, resolver, jwksLookup),
 		nil,
-		opts,
+		krtOpts,
 		nil,
+		opts...,
 	)
 	fc.RunAndWait(stop)
 	sq := &TestStatusQueue{

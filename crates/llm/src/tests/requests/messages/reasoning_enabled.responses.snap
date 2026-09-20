@@ -29,7 +29,7 @@ info:
     "max_output_tokens": 2048,
     "stream": false,
     "reasoning": {
-      "effort": "high"
+      "effort": "low"
     }
   },
   "parsed": {

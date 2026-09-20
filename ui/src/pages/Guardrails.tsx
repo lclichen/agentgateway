@@ -1,3 +1,4 @@
+import { useBlocker } from '@tanstack/react-router';
 import { Braces, ListChecks, Pencil, Plus, Save, ShieldCheck, Trash2 } from 'lucide-react';
 import { useMemo, useState } from 'react';
 
@@ -287,6 +288,11 @@ function GuardrailsEditor(props: {
 	const [draft, setDraft] = useState<GuardrailDraft>(() => initialDraft);
 	const [error, setError] = useState<string | null>(null);
 	const dirty = JSON.stringify(draft) !== JSON.stringify(initialDraft);
+	const blocker = useBlocker({
+		shouldBlockFn: ({ current, next }) => dirty && current.pathname !== next.pathname,
+		enableBeforeUnload: dirty,
+		withResolver: true
+	});
 
 	function validateAndBuild(nextDraft: GuardrailDraft) {
 		setDraft(nextDraft);
@@ -313,6 +319,17 @@ function GuardrailsEditor(props: {
 
 	return (
 		<div className="guardrails-editor">
+			{blocker.status === 'blocked' ? (
+				<ConfirmDialog
+					title="Discard unsaved changes?"
+					destructive
+					confirmLabel="Discard changes"
+					onCancel={blocker.reset}
+					onConfirm={blocker.proceed}
+				>
+					<p>Your guardrail changes have not been saved and will be lost.</p>
+				</ConfirmDialog>
+			) : null}
 			{error ? (
 				<StatusBanner state="bad" title="Invalid guardrails">
 					{error}

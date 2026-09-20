@@ -2130,6 +2130,7 @@ impl AIProvider {
 		tokenize: bool,
 		log: &mut Option<&mut RequestLog>,
 	) -> Result<PreparedRequest, AIError> {
+		let mut guardrail_rejection = None;
 		if let Some(p) = policies {
 			p.apply_prompt_enrichment(req);
 
@@ -2154,15 +2155,13 @@ impl AIProvider {
 						warn!("failed to call prompt guard webhook: {e}");
 						AIError::PromptWebhookError
 					})? {
-					return Ok(PreparedRequest::GuardrailRejected {
-						response,
-						guardrail,
-					});
+					guardrail_rejection = Some((response, guardrail));
 				}
 			}
 		}
 
-		let mut llm_info = req.to_llm_request(self.provider(), tokenize)?;
+		let mut llm_info =
+			req.to_llm_request(self.provider(), tokenize && guardrail_rejection.is_none())?;
 		if original_format == InputFormat::Detect {
 			types::detect::amend_request_info(&mut llm_info, parts.uri.path());
 		}
@@ -2177,6 +2176,17 @@ impl AIProvider {
 			if log.cel.cel_context.needs_llm_prompt() {
 				llm_info.prompt = Some(req.get_messages().into());
 			}
+		}
+
+		if let Some((response, guardrail)) = guardrail_rejection {
+			// Rejections skip the success path that normally attaches LLM metadata.
+			if let Some(log) = log {
+				log.llm_request = Some(llm_info);
+			}
+			return Ok(PreparedRequest::GuardrailRejected {
+				response,
+				guardrail,
+			});
 		}
 
 		Ok(PreparedRequest::Ready(llm_info))
@@ -2440,19 +2450,20 @@ impl AIProvider {
 				response_prompt_guard_headers(&parts.headers, rate_limit.request_traceparent.as_ref());
 
 			// Apply response prompt guard
-			if let Some(dr) = Policy::apply_response_prompt_guard(
-				&client,
-				resp.as_mut(),
-				&prompt_guard_headers,
-				&rate_limit.prompt_guard,
-				req_snapshot.as_deref(),
-				Some(&guardrail_log),
-			)
-			.await
-			.map_err(|e| {
-				warn!("failed to apply response prompt guard: {e}");
-				AIError::PromptWebhookError
-			})? {
+			if req.input_format.supports_prompt_guard()
+				&& let Some(dr) = Policy::apply_response_prompt_guard(
+					&client,
+					resp.as_mut(),
+					&prompt_guard_headers,
+					&rate_limit.prompt_guard,
+					req_snapshot.as_deref(),
+					Some(&guardrail_log),
+				)
+				.await
+				.map_err(|e| {
+					warn!("failed to apply response prompt guard: {e}");
+					AIError::PromptWebhookError
+				})? {
 				return Ok(dr.map(|replacement| {
 					managed_body.replace_content(replacement.into_boxed().into());
 					managed_body

@@ -107,6 +107,8 @@ pub fn make_evaluator(
 		guardrail_log,
 		worst_action: GuardrailAction::Allow,
 		audit_recorded: false,
+		allow_recorded: false,
+		fail_open_recorded: false,
 	})
 }
 
@@ -120,6 +122,9 @@ struct ResponseGuardEvaluator {
 	worst_action: GuardrailAction,
 	// Only log the audit action once per stream, even if triggered by multiple windows.
 	audit_recorded: bool,
+	// Deduplicate passing windows
+	allow_recorded: bool,
+	fail_open_recorded: bool,
 }
 
 impl ResponseGuardEvaluator {
@@ -157,6 +162,7 @@ impl StreamingEvaluator for ResponseGuardEvaluator {
 			&self.http_headers,
 			self.original.as_deref(),
 			log,
+			&mut self.allow_recorded,
 		)
 		.await
 		{
@@ -172,6 +178,16 @@ impl StreamingEvaluator for ResponseGuardEvaluator {
 					FailureMode::FailClosed => GuardrailAction::Reject,
 					FailureMode::FailOpen => GuardrailAction::FailOpen,
 				};
+				if action != GuardrailAction::FailOpen || !self.fail_open_recorded {
+					super::record_guardrail(
+						Some(&self.guardrail_log),
+						GuardrailPhase::Response,
+						self.guard.kind.name(),
+						action,
+						None,
+					);
+					self.fail_open_recorded |= action == GuardrailAction::FailOpen;
+				}
 				self.observe_action(action);
 				Err(e)
 			},

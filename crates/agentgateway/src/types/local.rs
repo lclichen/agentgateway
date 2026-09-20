@@ -18,8 +18,8 @@ use secrecy::SecretString;
 use crate::http::auth::jwt_sign::LocalJwtSignAuth;
 use crate::http::auth::{BackendAuth, BackendAuthKind};
 use crate::http::backendtls::{LocalBackendTLS, ResolvedBackendTLS};
-use crate::http::transformation_cel::{LocalTransformationConfig, Transformation};
-use crate::http::{filters, health, retry, timeout, transformation_cel};
+use crate::http::transformation_cel::{Transformation, TransformerConfig};
+use crate::http::{filters, health, retry, timeout};
 use crate::llm::policy::{PromptCachingConfig, PromptGuard};
 use crate::llm::{AIBackend, AIProvider, NamedAIProvider, anthropic, copilot, custom, openai};
 use crate::mcp::{FailureMode, McpAuthorization};
@@ -46,7 +46,7 @@ type LocalDirectResponsePolicy = LocalExplicitOrConditional<filters::DirectRespo
 type LocalExtProcPolicy = LocalExplicitOrConditional<crate::http::ext_proc::ExtProc>;
 type LocalRemoteRateLimitPolicy =
 	LocalExplicitOrConditional<crate::http::remoteratelimit::RemoteRateLimit>;
-type LocalTransformationPolicy = LocalExplicitOrConditional<LocalTransformationConfig>;
+type LocalTransformationPolicy = LocalExplicitOrConditional<Transformation>;
 type LocalMcpGuardrails = crate::mcp::guardrails::McpGuardrails;
 const DEFAULT_LLM_PORT: u16 = 4000;
 const DEFAULT_MCP_PORT: u16 = 3000;
@@ -247,17 +247,21 @@ fn merge_deprecated_frontend_policies(
 		} = tracing;
 
 		let mut policies = if !headers.is_empty() {
-			let backend_xfm = transformation_cel::LocalTransformationConfig {
-				request: Some(transformation_cel::LocalTransform {
+			let backend_xfm = Transformation {
+				request: Some(Arc::new(TransformerConfig {
 					set: headers
 						.into_iter()
-						.map(|(k, v)| (strng::new(k), strng::new(v)))
-						.collect(),
+						.map(|(k, v)| {
+							Ok((
+								http::HeaderOrPseudo::try_from(k.as_str())?,
+								cel::Expression::new_strict(&v)?,
+							))
+						})
+						.collect::<anyhow::Result<_>>()?,
 					..Default::default()
-				}),
-				response: None,
+				})),
+				..Default::default()
 			};
-			let backend_xfm = Transformation::try_from_local_config(backend_xfm, true)?;
 			vec![BackendTrafficPolicy::Transformation(Arc::new(backend_xfm))]
 		} else {
 			Vec::new()
@@ -723,23 +727,18 @@ fn validate_local_conditional_policies<T>(
 	Ok(())
 }
 
-impl LocalExplicitOrConditional<LocalTransformationConfig> {
+impl LocalExplicitOrConditional<Transformation> {
 	fn into_transformation_policy(self) -> anyhow::Result<RequestPolicy<Transformation>> {
 		match self {
-			LocalExplicitOrConditional::Explicit(policy) => Ok(RequestPolicy::single(
-				Transformation::try_from_local_config(policy, true)?,
-			)),
+			LocalExplicitOrConditional::Explicit(policy) => Ok(RequestPolicy::single(policy)),
 			LocalExplicitOrConditional::Conditional(policies) => {
 				validate_local_conditional_policies(&policies)?;
 				Ok(RequestPolicy::from_policies(
 					policies
 						.conditional
 						.into_iter()
-						.map(|entry| {
-							Transformation::try_from_local_config(entry.policy, true)
-								.map(|policy| (policy, entry.condition))
-						})
-						.collect::<anyhow::Result<Vec<_>>>()?,
+						.map(|entry| (entry.policy, entry.condition))
+						.collect::<Vec<_>>(),
 				))
 			},
 		}
@@ -946,8 +945,8 @@ pub struct LocalLLMParams {
 	/// Base URL for the upstream provider. Expands to hostOverride, pathPrefix, and tls for https URLs.
 	/// The URL path is the upstream base path and defaults to / when omitted.
 	/// Provider-specific endpoint paths are appended to this base path.
-	/// For example, https://api.openai.com/v1 sends completions to /v1/chat/completions,
-	/// while https://api.openai.com sends them to /chat/completions.
+	/// For example, `https://api.openai.com/v1` sends completions to `/v1/chat/completions`,
+	/// while `https://api.openai.com` sends them to `/chat/completions`.
 	#[serde(default)]
 	base_url: Option<Strng>,
 	/// Override the upstream host for this provider.
@@ -2304,18 +2303,6 @@ struct LocalPolicy {
 	pub policy: FilterOrPolicy,
 }
 
-pub fn de_transform<'de, D>(
-	deserializer: D,
-) -> Result<Option<crate::http::transformation_cel::Transformation>, D::Error>
-where
-	D: Deserializer<'de>,
-{
-	<Option<LocalTransformationConfig>>::deserialize(deserializer)?
-		.map(|c| http::transformation_cel::Transformation::try_from_local_config(c, true))
-		.transpose()
-		.map_err(serde::de::Error::custom)
-}
-
 pub fn de_backend_auth<'de, D>(deserializer: D) -> Result<Option<LocalBackendAuth>, D::Error>
 where
 	D: Deserializer<'de>,
@@ -2660,11 +2647,6 @@ pub struct SimpleLocalBackendPolicies {
 
 	/// Modify request and response data for this backend.
 	#[serde(default)]
-	#[serde(deserialize_with = "de_transform")]
-	#[cfg_attr(
-		feature = "schema",
-		schemars(with = "Option<http::transformation_cel::LocalTransformationConfig>")
-	)]
 	pub transformations: Option<crate::http::transformation_cel::Transformation>,
 
 	/// TLS settings used when connecting to this backend.
@@ -4530,7 +4512,7 @@ async fn convert_llm_config(
 				})
 			},
 			LocalModelAIProvider::Builtin(LocalBuiltinModelAIProvider::Custom(custom_provider)) => {
-				if custom_provider.formats.is_empty() {
+				if custom_provider.formats.is_empty() && model_config.passthrough.is_none() {
 					bail!(
 						"custom provider for model {} must specify at least one format",
 						model_config.name
@@ -5546,9 +5528,7 @@ pub(crate) async fn split_policies_for_target(
 			let LocalExplicitOrConditional::Explicit(cfg) = p else {
 				bail!("conditional transformations are not supported on backend-targeted policies");
 			};
-			backend_policies.push(BackendTrafficPolicy::Transformation(Arc::new(
-				Transformation::try_from_local_config(cfg, true)?,
-			)));
+			backend_policies.push(BackendTrafficPolicy::Transformation(Arc::new(cfg)));
 		} else {
 			route_policies.push(TrafficPolicy::Transformation(
 				p.into_transformation_policy()?,

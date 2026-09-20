@@ -11,12 +11,12 @@ use http::StatusCode;
 use itertools::Itertools;
 use rmcp::ErrorData;
 use rmcp::model::{
-	CacheScope, ClientJsonRpcMessage, ClientNotification, ClientRequest, ConstString, DiscoverResult,
-	ExtensionCapabilities, Extensions, Implementation, JsonRpcNotification, JsonRpcRequest,
-	ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-	PaginatedRequestParams, ProtocolVersion, RequestId, RequestMetaObject, ResultType,
-	ServerCapabilities, ServerInfo, ServerJsonRpcMessage, ServerNotification, ServerRequest,
-	ServerResult, SubscriptionFilter,
+	CacheScope, CallToolRequestMethod, ClientJsonRpcMessage, ClientNotification, ClientRequest,
+	ConstString, DiscoverResult, ExtensionCapabilities, Extensions, Implementation,
+	JsonRpcNotification, JsonRpcRequest, ListPromptsResult, ListResourceTemplatesResult,
+	ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, RequestId,
+	RequestMetaObject, ResultType, ServerCapabilities, ServerConfig, ServerJsonRpcMessage,
+	ServerNotification, ServerRequest, ServerResult, SubscriptionFilter,
 };
 use tracing::{debug, info, warn};
 
@@ -685,7 +685,11 @@ impl Relay {
 					message = %rej.message,
 					"mcpGuardrails: request rejected",
 				);
-				Err(UpstreamError::McpGuardrails(rej))
+				Err(UpstreamError::McpGuardrails {
+					rej,
+					was_tool_call: method == CallToolRequestMethod::VALUE,
+					downstream_modern: ctx_downstream_modern(ctx),
+				})
 			},
 		}
 	}
@@ -1090,7 +1094,11 @@ impl Relay {
 			)
 			.await;
 			if let crate::mcp::guardrails::Outcome::Reject(rej) = outcome {
-				return Err(UpstreamError::McpGuardrails(rej));
+				return Err(UpstreamError::McpGuardrails {
+					rej,
+					was_tool_call: r.request.method() == CallToolRequestMethod::VALUE,
+					downstream_modern: ctx_downstream_modern(ctx),
+				});
 			}
 		}
 
@@ -1578,7 +1586,7 @@ impl Relay {
 		upstream_instructions: Vec<(String, String)>,
 		extensions: Option<ExtensionCapabilities>,
 		server_overrides: Option<McpServerOverrides>,
-	) -> ServerInfo {
+	) -> ServerConfig {
 		let capabilities = {
 			// Prompts are supported with multiplexing using proxy-prefixed names.
 			// Resources are supported with multiplexing using service+<uri> prefixing.
@@ -1624,7 +1632,7 @@ impl Relay {
 		if let Some(title) = server_overrides.as_ref().and_then(|o| o.title.clone()) {
 			server_info = server_info.with_title(title.to_string());
 		}
-		ServerInfo::new(capabilities)
+		ServerConfig::new(capabilities)
 			.with_protocol_version(pv)
 			.with_server_info(server_info)
 			.with_instructions(instructions.unwrap_or_default())

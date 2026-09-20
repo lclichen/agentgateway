@@ -15,7 +15,7 @@ use futures_util::StreamExt;
 use headers::HeaderMapExt;
 use http_body_util::BodyExt as _;
 use rmcp::model::{
-	ClientInfo, ClientJsonRpcMessage, ClientNotification, ClientRequest, ConstString, GetMeta,
+	ClientConfig, ClientJsonRpcMessage, ClientNotification, ClientRequest, ConstString, GetMeta,
 	Implementation, InitializeRequest, JsonRpcRequest, ProtocolVersion, Reference, RequestId,
 	RequestMetaObject, ServerJsonRpcMessage,
 };
@@ -401,9 +401,19 @@ impl Session {
 			}) if req_id.is_some() => {
 				Err(mcp::Error::Authorization(req_id.unwrap(), resource_type, resource_name).into())
 			},
-			Err(UpstreamError::McpGuardrails(rej)) if req_id.is_some() => {
-				Err(mcp::Error::McpGuardrails(req_id.unwrap(), rej).into())
-			},
+			Err(UpstreamError::McpGuardrails {
+				rej,
+				was_tool_call,
+				downstream_modern: modern,
+			}) if req_id.is_some() => Err(
+				mcp::Error::McpGuardrails {
+					request_id: req_id.unwrap(),
+					rej,
+					was_tool_call,
+					downstream_modern: modern,
+				}
+				.into(),
+			),
 			Err(UpstreamError::InvalidRequest(message)) if req_id.is_some() && downstream_modern => {
 				Err(mcp::Error::InvalidParams(req_id, message).into())
 			},
@@ -1104,8 +1114,8 @@ impl sse_stream::Timer for TokioSseTimer {
 	}
 }
 
-fn get_client_info() -> ClientInfo {
-	let mut client_info = ClientInfo::default();
+fn get_client_info() -> ClientConfig {
+	let mut client_info = ClientConfig::default();
 	client_info.protocol_version = ProtocolVersion::V_2025_11_25;
 	client_info.capabilities = rmcp::model::ClientCapabilities::default();
 	client_info.client_info =

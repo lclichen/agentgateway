@@ -8,6 +8,7 @@ import curlIcon from '@/assets/curl.svg';
 import cursorIcon from '@/assets/cursor.svg';
 import gooseIcon from '@/assets/goose.svg';
 import opencodeIcon from '@/assets/opencode.svg';
+import piIcon from '@/assets/pi.svg';
 import githubCopilotIcon from '@/assets/providers/copilot.svg';
 import windsurfIcon from '@/assets/windsurf.svg';
 import { claudeSubscriptionWarning } from '@/claudeSubscription';
@@ -38,7 +39,16 @@ type ClientRecipe = {
 	id: string;
 	title: string;
 	description: string;
-	icon: 'claude' | 'codex' | 'curl' | 'cursor' | 'copilot' | 'goose' | 'opencode' | 'windsurf';
+	icon:
+		| 'claude'
+		| 'codex'
+		| 'curl'
+		| 'cursor'
+		| 'copilot'
+		| 'goose'
+		| 'opencode'
+		| 'pi'
+		| 'windsurf';
 	provider?: ProviderName;
 	steps?: ReactNode[];
 	language: string;
@@ -370,7 +380,7 @@ export AGENTGATEWAY_API_KEY=${JSON.stringify(args.apiKey)}  # Alternatively, typ
 		{
 			id: 'curl',
 			title: 'curl',
-			description: 'Minimal raw HTTP request for debugging client connectivity.',
+			description: 'Send a chat completion request to agentgateway with curl.',
 			icon: 'curl',
 			language: 'bash',
 			code: `curl ${JSON.stringify(completions)} ${continuation}
@@ -385,8 +395,7 @@ ${curlAuthorization}  -H "Content-Type: application/json" ${continuation}
 		{
 			id: 'claude-code',
 			title: 'Claude Code',
-			description:
-				'Use the gateway URL and key with Claude-compatible model routes when configured.',
+			description: 'Connect Claude Code to agentgateway using the Anthropic Messages API.',
 			icon: 'claude',
 			language: 'bash',
 			code: `export ANTHROPIC_AUTH_TOKEN=${JSON.stringify(requiredApiKey)}
@@ -397,7 +406,7 @@ claude --model ${JSON.stringify(args.model)}`
 		{
 			id: 'claude-desktop',
 			title: 'Claude Desktop',
-			description: 'Route Claude Desktop third-party inference through the gateway.',
+			description: 'Connect Claude Desktop to agentgateway using third-party inference settings.',
 			icon: 'claude',
 			steps: [
 				<>
@@ -421,8 +430,7 @@ API Key: ${requiredApiKey}`
 		{
 			id: 'codex',
 			title: 'Codex CLI',
-			description:
-				'Use OpenAI-compatible environment variables when running Codex against the gateway.',
+			description: 'Connect Codex CLI to agentgateway with a custom model provider.',
 			icon: 'codex',
 			language: 'bash',
 			code: `export OPENAI_API_KEY=${JSON.stringify(requiredApiKey)}
@@ -439,7 +447,7 @@ codex --model "${args.model}" \\
 		{
 			id: 'opencode',
 			title: 'OpenCode',
-			description: 'Configure OpenCode with an OpenAI-compatible gateway provider.',
+			description: 'Connect OpenCode to agentgateway.',
 			icon: 'opencode',
 			steps: [
 				<>
@@ -475,9 +483,40 @@ ${openCodeApiKeyExport}
 opencode`
 		},
 		{
+			id: 'pi',
+			title: 'Pi',
+			description: 'Connect Pi to agentgateway using the Responses API.',
+			icon: 'pi',
+			steps: [
+				<>
+					Add this configuration to <code>~/.pi/agent/models.json</code>. If the file exists, merge
+					the <code>agentgateway</code> entry into its <code>providers</code> object.
+				</>,
+				<>
+					Start <code>pi</code>, then use <code>/model</code> to select <code>{args.model}</code>{' '}
+					under <code>agentgateway</code>.
+				</>
+			],
+			language: 'json',
+			code: JSON.stringify(
+				{
+					providers: {
+						agentgateway: {
+							baseUrl: v1,
+							api: 'openai-responses',
+							apiKey: requiredApiKey,
+							models: [{ id: args.model }]
+						}
+					}
+				},
+				null,
+				2
+			)
+		},
+		{
 			id: 'goose',
 			title: 'Goose',
-			description: "Point Goose's OpenAI provider at the gateway host and chat completions path.",
+			description: 'Connect Goose to agentgateway using its OpenAI provider.',
 			icon: 'goose',
 			steps: [
 				<>
@@ -505,7 +544,7 @@ goose session`
 		{
 			id: 'cursor',
 			title: 'Cursor',
-			description: "Use Cursor's OpenAI base URL override with a gateway model.",
+			description: 'Connect Cursor to agentgateway using the OpenAI base URL override.',
 			icon: 'cursor',
 			steps: [
 				<>
@@ -527,7 +566,7 @@ Custom model: ${args.model}`
 		{
 			id: 'github-copilot',
 			title: 'GitHub Copilot',
-			description: 'Configure VS Code Copilot Business or Enterprise to use the gateway proxy.',
+			description: 'Connect VS Code Copilot Business or Enterprise to agentgateway.',
 			icon: 'copilot',
 			steps: [
 				<>
@@ -548,7 +587,7 @@ Custom model: ${args.model}`
 		{
 			id: 'windsurf',
 			title: 'Windsurf',
-			description: 'Route Windsurf traffic through the gateway HTTP proxy setting.',
+			description: 'Connect Windsurf to agentgateway using its HTTP proxy setting.',
 			icon: 'windsurf',
 			steps: [
 				<>
@@ -567,7 +606,7 @@ Custom model: ${args.model}`
 		{
 			id: 'openai-js',
 			title: 'OpenAI JavaScript SDK',
-			description: 'Use the gateway as an OpenAI-compatible chat completions endpoint.',
+			description: 'Call agentgateway using the OpenAI JavaScript SDK.',
 			icon: 'codex',
 			provider: 'openai',
 			language: 'ts',
@@ -588,7 +627,7 @@ console.log(response.choices[0]?.message?.content);`
 		{
 			id: 'openai-python',
 			title: 'OpenAI Python SDK',
-			description: 'Point the Python SDK at the gateway listener.',
+			description: 'Call agentgateway using the OpenAI Python SDK.',
 			icon: 'codex',
 			provider: 'openai',
 			language: 'python',
@@ -664,6 +703,13 @@ function ClientSetupIcon(props: { recipe: ClientRecipe; compact?: boolean }) {
 		return (
 			<span className={className}>
 				<img src={opencodeIcon} alt="" aria-hidden="true" />
+			</span>
+		);
+	}
+	if (props.recipe.icon === 'pi') {
+		return (
+			<span className={className}>
+				<img src={piIcon} alt="" aria-hidden="true" />
 			</span>
 		);
 	}

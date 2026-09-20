@@ -1417,16 +1417,16 @@ impl PartialEq for RequestRef<'_> {
 	}
 }
 
-/// Records one prompt-guard guardrail intervention.
+/// Records one prompt-guard guardrail evaluation.
 #[apply(schema!)]
 #[derive(Default, cel::DynamicType)]
 #[dynamic(rename_all = "camelCase")]
 pub struct GuardrailInfo {
-	/// The phase the guardrail intervened in: `request` or `response`.
+	/// The phase the guardrail was evaluated in: `request` or `response`.
 	pub phase: Strng,
-	/// The guard kind that intervened, such as `bedrockGuardrails`.
+	/// The guard kind that was evaluated, such as `bedrockGuardrails`.
 	pub guard: Strng,
-	/// The action the guardrail took (mask/reject/audit/failOpen).
+	/// The action the guardrail took (allow/mask/reject/audit/failOpen).
 	pub action: Strng,
 	#[serde(flatten, default)]
 	#[dynamic(flatten)]
@@ -1453,7 +1453,7 @@ pub struct GuardDetail {
 }
 
 impl GuardrailInfo {
-	/// Minimal details about which guardrail fired, when it fired and what the action was.
+	/// Minimal details about which guardrail was evaluated, its phase and its action.
 	/// Does not include detailed reasons or assessments.
 	pub fn minimal(&self) -> serde_json::Value {
 		let mut entry = serde_json::json!({
@@ -2203,7 +2203,7 @@ pub struct ExecutorSerde {
 	)]
 	pub mcp_guardrails: Option<McpGuardrailsDynamicMetadata>,
 
-	/// `guardrails` contains one entry per prompt-guard guardrail intervention, in either the
+	/// `guardrails` contains entries for prompt-guard guardrail evaluations, in either the
 	/// request or response phase. Only present in CEL that runs after the request completes,
 	/// such as log and metric fields.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
