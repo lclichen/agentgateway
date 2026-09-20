@@ -1,7 +1,9 @@
 name: Build Linux x64 binary
 
 # Personal fork helper: builds the standalone gateway (UI embedded) for
-# linux x64 and uploads the binary as a workflow artifact.
+# linux x64 pinned to older glibc versions and uploads the binaries as
+# workflow artifacts. The glibc 2.17 build runs on any distro with
+# glibc >= 2.17 (CentOS/RHEL 7+, and therefore also 2.28 systems).
 on:
   workflow_dispatch: {}
 
@@ -11,6 +13,10 @@ permissions:
 jobs:
   build-linux-x64:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        glibc: ["2.17", "2.28"]
     steps:
       - uses: actions/checkout@v4
 
@@ -28,21 +34,28 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
 
-      - name: Install Rust toolchain (pinned by rust-toolchain.toml)
-        run: rustup toolchain install --profile minimal
+      - name: Install cargo-zigbuild (glibc-version-pinned cross builds)
+        run: pip3 install cargo-zigbuild
+
+      - name: Add gnu target
+        run: rustup target add x86_64-unknown-linux-gnu
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             .
+          key: glibc-${{ matrix.glibc }}
 
-      - name: Build gateway (release, UI embedded)
-        run: cargo build --release -p agentgateway-app --features ui
+      - name: Build gateway (release, glibc ${{ matrix.glibc }}, UI embedded)
+        run: cargo zigbuild --release --target x86_64-unknown-linux-gnu.${{ matrix.glibc }} -p agentgateway-app --features ui
+
+      - name: Rename binary
+        run: cp target/x86_64-unknown-linux-gnu/release/agentgateway agentgateway-linux-x64-glibc${{ matrix.glibc }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: agentgateway-linux-x64
-          path: target/release/agentgateway
+          name: agentgateway-linux-x64-glibc${{ matrix.glibc }}
+          path: agentgateway-linux-x64-glibc${{ matrix.glibc }}
           if-no-files-found: error
