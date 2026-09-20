@@ -846,6 +846,17 @@ function ModelEditor(props: {
 					/>
 
 					<CollapsiblePolicySection
+						icon={<Activity size={17} />}
+						title="Model metadata"
+						description="Capabilities and limits advertised on the model list API (/v1/models)"
+					>
+						<ModelMetadataSection
+							metadata={model.metadata}
+							onChange={metadata => update({ model: { ...model, metadata } })}
+						/>
+					</CollapsiblePolicySection>
+
+					<CollapsiblePolicySection
 						icon={<SlidersHorizontal size={17} />}
 						title="Advanced"
 						description="Match conditions and model-specific policies"
@@ -904,6 +915,100 @@ function ModelEditor(props: {
 }
 
 type UpstreamModelMode = 'incoming' | 'explicit' | 'strip' | 'custom';
+
+function ModelMetadataSection(props: {
+	metadata: LlmModel['metadata'];
+	onChange: (metadata: LlmModel['metadata']) => void;
+}) {
+	const metadata = props.metadata ?? {};
+	const MODALITY_OPTIONS = [
+		{ value: 'text', label: 'Text' },
+		{ value: 'image', label: 'Image' },
+		{ value: 'audio', label: 'Audio' },
+		{ value: 'video', label: 'Video' }
+	];
+	function update(patch: Partial<NonNullable<LlmModel['metadata']>>) {
+		const next: Record<string, unknown> = { ...metadata };
+		for (const [key, value] of Object.entries(patch)) {
+			if (value == null || (Array.isArray(value) && value.length === 0)) delete next[key];
+			else next[key] = value;
+		}
+		props.onChange(Object.keys(next).length ? (next as NonNullable<LlmModel['metadata']>) : null);
+	}
+	function numberOrNull(value: string) {
+		const trimmed = value.trim();
+		if (!trimmed) return null;
+		const parsed = Number(trimmed);
+		return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : null;
+	}
+	function ModalityChips(propsChips: {
+		label: string;
+		values: string[] | null | undefined;
+		onChange: (values: string[] | null) => void;
+	}) {
+		const selected = new Set(propsChips.values ?? []);
+		function toggle(value: string) {
+			const next = new Set(selected);
+			if (next.has(value)) next.delete(value);
+			else next.add(value);
+			const ordered = MODALITY_OPTIONS.filter(option => next.has(option.value)).map(
+				option => option.value
+			);
+			propsChips.onChange(ordered.length ? ordered : null);
+		}
+		return (
+			<Field label={propsChips.label}>
+				<div className="segmented-control" role="group">
+					{MODALITY_OPTIONS.map(option => (
+						<button
+							key={option.value}
+							type="button"
+							aria-pressed={selected.has(option.value)}
+							className={selected.has(option.value) ? 'active' : ''}
+							onClick={() => toggle(option.value)}
+						>
+							{option.label}
+						</button>
+					))}
+				</div>
+			</Field>
+		);
+	}
+	return (
+		<div className="policy-editor-stack">
+			<div className="button-row">
+				<Field label="Context length (tokens)">
+					<input
+						type="number"
+						min={1}
+						value={metadata.contextLength ?? ''}
+						onChange={event => update({ contextLength: numberOrNull(event.target.value) })}
+						placeholder="131072"
+					/>
+				</Field>
+			</div>
+			<Field label="Max output tokens">
+				<input
+					type="number"
+					min={1}
+					value={metadata.maxOutputTokens ?? ''}
+					onChange={event => update({ maxOutputTokens: numberOrNull(event.target.value) })}
+					placeholder="16384"
+				/>
+			</Field>
+			<ModalityChips
+				label="Input modalities"
+				values={metadata.inputModalities}
+				onChange={inputModalities => update({ inputModalities })}
+			/>
+			<ModalityChips
+				label="Output modalities"
+				values={metadata.outputModalities}
+				onChange={outputModalities => update({ outputModalities })}
+			/>
+		</div>
+	);
+}
 
 function UpstreamModelFields(props: {
 	mode: UpstreamModelMode;
