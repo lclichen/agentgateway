@@ -25,6 +25,7 @@
 |`config.modelCatalog[].inline.providers.*.models.*.rates.reasoning`|string|Cost per 1M reasoning tokens. Falls back to the output rate if unset.|
 |`config.modelCatalog[].inline.providers.*.models.*.rates.inputAudio`|string|Cost per 1M input audio tokens. Falls back to the input rate if unset.|
 |`config.modelCatalog[].inline.providers.*.models.*.rates.outputAudio`|string|Cost per 1M output audio tokens. Falls back to the output rate if unset.|
+|`config.modelCatalog[].inline.providers.*.models.*.rates.perPage`|string|Cost per page, for document/OCR models.|
 |`config.modelCatalog[].inline.providers.*.models.*.tiers`|[]object|Context-length pricing tiers that override the base rates.|
 |`config.modelCatalog[].inline.providers.*.models.*.tiers[].contextOver`|integer|Context-token threshold above which this tier's rates apply.|
 |`config.modelCatalog[].inline.providers.*.models.*.tiers[].rates`|object|Pricing rates for this tier, overlaid on the base model rates.|
@@ -35,6 +36,7 @@
 |`config.modelCatalog[].inline.providers.*.models.*.tiers[].rates.reasoning`|string|Cost per 1M reasoning tokens. Falls back to the output rate if unset.|
 |`config.modelCatalog[].inline.providers.*.models.*.tiers[].rates.inputAudio`|string|Cost per 1M input audio tokens. Falls back to the input rate if unset.|
 |`config.modelCatalog[].inline.providers.*.models.*.tiers[].rates.outputAudio`|string|Cost per 1M output audio tokens. Falls back to the output rate if unset.|
+|`config.modelCatalog[].inline.providers.*.models.*.tiers[].rates.perPage`|string|Cost per page, for document/OCR models.|
 |`config.modelCatalog[].inline.providers.*.models.*.tags`|[]string|Freeform capability/routing tags for this model.|
 |`config.database`|object|Primary database used by local runtime features.|
 |`config.database.url`|string|Connection URL for the request log database. A postgres:// or postgresql:// URL uses Postgres; any other value is treated as a SQLite database.|
@@ -6221,7 +6223,7 @@
 |`binds[].listeners[].routes[].policies.substrateEgress.policies.backendTunnel.proxy.backend`|string|Explicit backend reference. Backend must be defined in the top level backends list|
 |`binds[].listeners[].routes[].policies.substrateEgress.policies.backendTunnel.mode`|enum|How requests are sent through the proxy.<br>Possible values: `auto`, `connect`.|
 |`binds[].listeners[].routes[].policies.substrateEgress.policies.backendTunnel.policies`|any|Policies to connect to the proxy backend|
-|`binds[].listeners[].routes[].policies.substrateEgress.credentialProviders`|[]object|Credential providers available to secret-backed egress effects, keyed by<br>the authority in a `substrate-secret://` URI.|
+|`binds[].listeners[].routes[].policies.substrateEgress.credentialProviders`|[]object|Credential providers available to secret-backed egress effects, keyed by<br>the authority in an `ate-secret://` URI.|
 |`binds[].listeners[].routes[].policies.substrateEgress.credentialProviders[].uriAuthority`|string|Exact credential URI authority handled by this provider, such as `kubernetes.io`.|
 |`binds[].listeners[].routes[].policies.substrateEgress.credentialProviders[].target`|object|Backend that resolves credentials and policies used when connecting to it.<br>Exactly one of service, host, or backend may be set.|
 |`binds[].listeners[].routes[].policies.substrateEgress.credentialProviders[].target.service`|object|Service reference. Service must be defined in the top level services list.|
@@ -27948,7 +27950,7 @@
 |`policies[].policy.substrateEgress.policies.backendTunnel.proxy.backend`|string|Explicit backend reference. Backend must be defined in the top level backends list|
 |`policies[].policy.substrateEgress.policies.backendTunnel.mode`|enum|How requests are sent through the proxy.<br>Possible values: `auto`, `connect`.|
 |`policies[].policy.substrateEgress.policies.backendTunnel.policies`|any|Policies to connect to the proxy backend|
-|`policies[].policy.substrateEgress.credentialProviders`|[]object|Credential providers available to secret-backed egress effects, keyed by<br>the authority in a `substrate-secret://` URI.|
+|`policies[].policy.substrateEgress.credentialProviders`|[]object|Credential providers available to secret-backed egress effects, keyed by<br>the authority in an `ate-secret://` URI.|
 |`policies[].policy.substrateEgress.credentialProviders[].uriAuthority`|string|Exact credential URI authority handled by this provider, such as `kubernetes.io`.|
 |`policies[].policy.substrateEgress.credentialProviders[].target`|object|Backend that resolves credentials and policies used when connecting to it.<br>Exactly one of service, host, or backend may be set.|
 |`policies[].policy.substrateEgress.credentialProviders[].target.service`|object|Service reference. Service must be defined in the top level services list.|
@@ -46533,7 +46535,7 @@
 |`routeGroups[].routes[].policies.substrateEgress.policies.backendTunnel.proxy.backend`|string|Explicit backend reference. Backend must be defined in the top level backends list|
 |`routeGroups[].routes[].policies.substrateEgress.policies.backendTunnel.mode`|enum|How requests are sent through the proxy.<br>Possible values: `auto`, `connect`.|
 |`routeGroups[].routes[].policies.substrateEgress.policies.backendTunnel.policies`|any|Policies to connect to the proxy backend|
-|`routeGroups[].routes[].policies.substrateEgress.credentialProviders`|[]object|Credential providers available to secret-backed egress effects, keyed by<br>the authority in a `substrate-secret://` URI.|
+|`routeGroups[].routes[].policies.substrateEgress.credentialProviders`|[]object|Credential providers available to secret-backed egress effects, keyed by<br>the authority in an `ate-secret://` URI.|
 |`routeGroups[].routes[].policies.substrateEgress.credentialProviders[].uriAuthority`|string|Exact credential URI authority handled by this provider, such as `kubernetes.io`.|
 |`routeGroups[].routes[].policies.substrateEgress.credentialProviders[].target`|object|Backend that resolves credentials and policies used when connecting to it.<br>Exactly one of service, host, or backend may be set.|
 |`routeGroups[].routes[].policies.substrateEgress.credentialProviders[].target.service`|object|Service reference. Service must be defined in the top level services list.|
@@ -67789,7 +67791,7 @@
 |`routes[].policies.substrateEgress.policies.backendTunnel.proxy.backend`|string|Explicit backend reference. Backend must be defined in the top level backends list|
 |`routes[].policies.substrateEgress.policies.backendTunnel.mode`|enum|How requests are sent through the proxy.<br>Possible values: `auto`, `connect`.|
 |`routes[].policies.substrateEgress.policies.backendTunnel.policies`|any|Policies to connect to the proxy backend|
-|`routes[].policies.substrateEgress.credentialProviders`|[]object|Credential providers available to secret-backed egress effects, keyed by<br>the authority in a `substrate-secret://` URI.|
+|`routes[].policies.substrateEgress.credentialProviders`|[]object|Credential providers available to secret-backed egress effects, keyed by<br>the authority in an `ate-secret://` URI.|
 |`routes[].policies.substrateEgress.credentialProviders[].uriAuthority`|string|Exact credential URI authority handled by this provider, such as `kubernetes.io`.|
 |`routes[].policies.substrateEgress.credentialProviders[].target`|object|Backend that resolves credentials and policies used when connecting to it.<br>Exactly one of service, host, or backend may be set.|
 |`routes[].policies.substrateEgress.credentialProviders[].target.service`|object|Service reference. Service must be defined in the top level services list.|
@@ -80628,7 +80630,7 @@
 |`llm.providers[].params.azureResourceType`|enum|For Azure: the type of Azure endpoint (openAI or foundry)<br>Possible values: `openAI`, `foundry`, `aiServices`.|
 |`llm.providers[].params.azureApiVersion`|string|For Azure: the API version to use|
 |`llm.providers[].params.azureProjectName`|string|For Azure: the Foundry project name (required for foundry resource type)|
-|`llm.providers[].params.baseUrl`|string|Base URL for the upstream provider. Expands to hostOverride, pathPrefix, and tls for https URLs.<br>The URL path is the upstream base path and defaults to / when omitted.<br>Provider-specific endpoint paths are appended to this base path.<br>For example, https://api.openai.com/v1 sends completions to /v1/chat/completions,<br>while https://api.openai.com sends them to /chat/completions.|
+|`llm.providers[].params.baseUrl`|string|Base URL for the upstream provider. Expands to hostOverride, pathPrefix, and tls for https URLs.<br>The URL path is the upstream base path and defaults to / when omitted.<br>Provider-specific endpoint paths are appended to this base path.<br>For example, `https://api.openai.com/v1` sends completions to `/v1/chat/completions`,<br>while `https://api.openai.com` sends them to `/chat/completions`.|
 |`llm.providers[].params.hostOverride`|string|Override the upstream host for this provider.|
 |`llm.providers[].params.pathOverride`|string|Override the upstream path for this provider.|
 |`llm.providers[].params.pathPrefix`|string|Override the default base path prefix for this provider.|
@@ -81356,7 +81358,7 @@
 |`llm.models[].params.azureResourceType`|enum|For Azure: the type of Azure endpoint (openAI or foundry)<br>Possible values: `openAI`, `foundry`, `aiServices`.|
 |`llm.models[].params.azureApiVersion`|string|For Azure: the API version to use|
 |`llm.models[].params.azureProjectName`|string|For Azure: the Foundry project name (required for foundry resource type)|
-|`llm.models[].params.baseUrl`|string|Base URL for the upstream provider. Expands to hostOverride, pathPrefix, and tls for https URLs.<br>The URL path is the upstream base path and defaults to / when omitted.<br>Provider-specific endpoint paths are appended to this base path.<br>For example, https://api.openai.com/v1 sends completions to /v1/chat/completions,<br>while https://api.openai.com sends them to /chat/completions.|
+|`llm.models[].params.baseUrl`|string|Base URL for the upstream provider. Expands to hostOverride, pathPrefix, and tls for https URLs.<br>The URL path is the upstream base path and defaults to / when omitted.<br>Provider-specific endpoint paths are appended to this base path.<br>For example, `https://api.openai.com/v1` sends completions to `/v1/chat/completions`,<br>while `https://api.openai.com` sends them to `/chat/completions`.|
 |`llm.models[].params.hostOverride`|string|Override the upstream host for this provider.|
 |`llm.models[].params.pathOverride`|string|Override the upstream path for this provider.|
 |`llm.models[].params.pathPrefix`|string|Override the default base path prefix for this provider.|
@@ -95245,7 +95247,7 @@
 |`mcp.policies.substrateEgress.policies.backendTunnel.proxy.backend`|string|Explicit backend reference. Backend must be defined in the top level backends list|
 |`mcp.policies.substrateEgress.policies.backendTunnel.mode`|enum|How requests are sent through the proxy.<br>Possible values: `auto`, `connect`.|
 |`mcp.policies.substrateEgress.policies.backendTunnel.policies`|any|Policies to connect to the proxy backend|
-|`mcp.policies.substrateEgress.credentialProviders`|[]object|Credential providers available to secret-backed egress effects, keyed by<br>the authority in a `substrate-secret://` URI.|
+|`mcp.policies.substrateEgress.credentialProviders`|[]object|Credential providers available to secret-backed egress effects, keyed by<br>the authority in an `ate-secret://` URI.|
 |`mcp.policies.substrateEgress.credentialProviders[].uriAuthority`|string|Exact credential URI authority handled by this provider, such as `kubernetes.io`.|
 |`mcp.policies.substrateEgress.credentialProviders[].target`|object|Backend that resolves credentials and policies used when connecting to it.<br>Exactly one of service, host, or backend may be set.|
 |`mcp.policies.substrateEgress.credentialProviders[].target.service`|object|Service reference. Service must be defined in the top level services list.|

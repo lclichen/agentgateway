@@ -320,6 +320,15 @@ pub mod from_messages {
 		thinking: Option<messages::ThinkingInput>,
 		effort: Option<messages::ThinkingEffort>,
 	) -> Option<responses::Reasoning> {
+		let effort = effort.or_else(|| {
+			if let Some(messages::ThinkingInput::Enabled { budget_tokens }) = &thinking {
+				Some(crate::types::anthropic_effort_for_thinking_budget(
+					*budget_tokens,
+				))
+			} else {
+				None
+			}
+		});
 		match thinking {
 			Some(messages::ThinkingInput::Disabled {}) => None,
 			None if effort.is_none() => None,

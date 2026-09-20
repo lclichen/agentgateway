@@ -907,7 +907,7 @@ impl Gateway {
 			src.connect_headers = ch.0;
 		}
 		if let Some(network_authorization) = policies.network_authorization.as_ref()
-			&& let Err(e) = network_authorization.apply(&src)
+			&& let Err(e) = network_authorization.apply(&crate::cel::Executor::new_tcp(Some(&src), &dst))
 		{
 			anyhow::bail!("network authorization denied: {e}");
 		}

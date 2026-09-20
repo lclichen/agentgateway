@@ -27,7 +27,7 @@ use llm::{AIBackend, AIProvider, NamedAIProvider};
 use super::agent::*;
 use crate::http::auth::{AwsAuth, BackendAuth, BackendAuthKind, GcpAuth};
 use crate::http::buffer::BufferBody;
-use crate::http::transformation_cel::{LocalTransform, LocalTransformationConfig, Transformation};
+use crate::http::transformation_cel::{Transformation, TransformerConfig};
 use crate::http::{HeaderOrPseudo, Scheme, auth, authorization, health};
 use crate::mcp::{FailureMode, McpAuthorization};
 use crate::store::RequestPolicy;
@@ -1235,11 +1235,19 @@ fn backend_auth_kind_from_proto(
 			location: optional_authorization_location(k.authorization_location.as_ref())?,
 		},
 		Some(proto::agent::backend_auth_policy::Kind::Gcp(g)) => {
-			let credential = g
-				.credential
-				.map(|credential| auth::gcp::GcpCredential::new(credential.into()))
-				.transpose()
-				.map_err(|e| ProtoError::Generic(e.to_string()))?;
+			let credential =
+				g.credential.map(
+					|credential| match auth::gcp::GcpCredential::new(credential.into()) {
+						Ok(credential) => credential,
+						Err(error) => {
+							let reason = auth::gcp::sanitize_credential_error(&error);
+							diagnostics.add_warning(format!(
+								"GCP credential is invalid; requests using this policy will be rejected: {reason}"
+							));
+							auth::gcp::GcpCredential::new_invalid(reason)
+						},
+					},
+				);
 			BackendAuthKind::Gcp(match g.token_type {
 				None | Some(gcp::TokenType::AccessToken(gcp::AccessToken {})) => GcpAuth::AccessToken {
 					r#type: Some(auth::gcp::AccessToken),
@@ -2256,52 +2264,49 @@ fn transformation_from_proto(
 ) -> Result<Transformation, ProtoError> {
 	fn convert_transform(
 		t: &Option<proto::agent::traffic_policy_spec::transformation_policy::Transform>,
-	) -> LocalTransform {
-		let mut add = Vec::new();
-		let mut set = Vec::new();
-		let mut remove = Vec::new();
-		let mut body = None;
-		let mut metadata = Vec::new();
-
-		if let Some(t) = t {
-			for h in &t.add {
-				add.push((h.name.clone().into(), h.expression.clone().into()));
-			}
-			for h in &t.set {
-				set.push((h.name.clone().into(), h.expression.clone().into()));
-			}
-			for r in &t.remove {
-				remove.push(r.clone().into());
-			}
-			if let Some(b) = &t.body {
-				body = Some(b.expression.clone().into());
-			}
-			for (k, v) in &t.metadata {
-				metadata.push((k.clone().into(), v.clone().into()));
-			}
+		diagnostics: &mut Diagnostics,
+	) -> Result<Option<Arc<TransformerConfig>>, ProtoError> {
+		let Some(t) = t else {
+			return Ok(None);
+		};
+		let mut config = TransformerConfig::default();
+		for h in &t.set {
+			config.set.push((
+				crate::http::HeaderOrPseudo::try_from(h.name.as_str())
+					.map_err(|e| ProtoError::Generic(e.to_string()))?,
+				permissive_cel_expression(diagnostics, "transformation", &h.expression),
+			));
 		}
-
-		LocalTransform {
-			add,
-			set,
-			remove,
-			// `replace` is only available via local file config today; the XDS proto does not
-			// carry it yet, so dynamic configs leave it unset.
-			replace: None,
-			body,
-			metadata,
+		for h in &t.add {
+			config.add.push((
+				crate::http::HeaderOrPseudo::try_from(h.name.as_str())
+					.map_err(|e| ProtoError::Generic(e.to_string()))?,
+				permissive_cel_expression(diagnostics, "transformation", &h.expression),
+			));
 		}
+		for r in &t.remove {
+			config.remove.push(
+				::http::HeaderName::try_from(r.as_str()).map_err(|e| ProtoError::Generic(e.to_string()))?,
+			);
+		}
+		config.body = t
+			.body
+			.as_ref()
+			.map(|b| permissive_cel_expression(diagnostics, "transformation", &b.expression));
+		for (k, v) in &t.metadata {
+			config.metadata.push((
+				k.clone().into(),
+				permissive_cel_expression(diagnostics, "transformation", v),
+			));
+		}
+		// The xDS proto does not carry replace yet, so it remains unset.
+		Ok(Some(Arc::new(config)))
 	}
 
-	let request = Some(convert_transform(&spec.request));
-	let response = Some(convert_transform(&spec.response));
-	let config = LocalTransformationConfig { request, response };
-	Transformation::try_from_local_config_with_warnings(config, false, |expression, err| {
-		diagnostics.add_warning(format!(
-			"invalid CEL expression for transformation: {err}; replacing {expression:?} with an expression that always fails",
-		));
+	Ok(Transformation {
+		request: convert_transform(&spec.request, diagnostics)?,
+		response: convert_transform(&spec.response, diagnostics)?,
 	})
-	.map_err(|e| ProtoError::Generic(e.to_string()))
 }
 
 fn backend_policy_from_proto(
@@ -5313,6 +5318,77 @@ mod tests {
 		assert_eq!(service_name.as_deref(), Some("bedrock-agentcore"));
 		assert_eq!(region.as_deref(), Some("us-east-1"));
 		Ok(())
+	}
+
+	#[test]
+	fn invalid_gcp_credential_becomes_runtime_invalid() {
+		for token_type in [
+			None,
+			Some(proto::agent::gcp::TokenType::IdToken(
+				proto::agent::gcp::IdToken {
+					audience: Some("https://aud.example".to_string()),
+				},
+			)),
+		] {
+			let mut diagnostics = Diagnostics::default();
+			let auth = backend_auth_kind_from_proto(
+				proto::agent::BackendAuthPolicy {
+					kind: Some(proto::agent::backend_auth_policy::Kind::Gcp(
+						proto::agent::Gcp {
+							credential: Some(
+								r#"{"type":"service_account","project_id":"project","private_key_id":"key-id","private_key":"PRIVATE_KEY"}"#.to_string(),
+							),
+							token_type,
+						},
+					)),
+					..Default::default()
+				},
+				&mut diagnostics,
+			)
+			.expect("invalid credentials should not reject the resource");
+			let credential = match auth {
+				Some(BackendAuthKind::Gcp(
+					GcpAuth::AccessToken { credential, .. } | GcpAuth::IdToken { credential, .. },
+				)) => credential.expect("explicit credential must be retained"),
+				_ => panic!("expected GCP auth"),
+			};
+			assert_eq!(
+				credential.invalid_reason(),
+				Some("GCP credential is missing required field `client_email`")
+			);
+			let warnings = diagnostics.into_warnings();
+			assert_eq!(warnings.len(), 1);
+			assert!(warnings[0].contains("client_email"));
+			assert!(!warnings[0].contains("PRIVATE_KEY"));
+		}
+	}
+
+	#[test]
+	fn malformed_and_unsupported_gcp_credentials_warn_without_leaking_values() {
+		for (credential, expected_warning) in [
+			("{MARKER", "failed to parse GCP credential JSON"),
+			(r#"{"type":"MARKER"}"#, "unsupported GCP credential type"),
+		] {
+			let mut diagnostics = Diagnostics::default();
+			let auth = backend_auth_kind_from_proto(
+				proto::agent::BackendAuthPolicy {
+					kind: Some(proto::agent::backend_auth_policy::Kind::Gcp(
+						proto::agent::Gcp {
+							credential: Some(credential.to_string()),
+							token_type: None,
+						},
+					)),
+					..Default::default()
+				},
+				&mut diagnostics,
+			)
+			.expect("invalid credentials should not reject the resource");
+			assert!(matches!(auth, Some(BackendAuthKind::Gcp(_))));
+			let warnings = diagnostics.into_warnings();
+			assert_eq!(warnings.len(), 1);
+			assert!(warnings[0].contains(expected_warning));
+			assert!(!warnings[0].contains("MARKER"));
+		}
 	}
 
 	#[test]

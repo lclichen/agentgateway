@@ -250,7 +250,7 @@ jobs:
 
     - name: Build controller binary
       run: |
-        CGO_ENABLED=0 GOARCH=${{ matrix.goarch }} GOOS=linux go build \
+        CGO_ENABLED=0 GOARCH=${{ matrix.goarch }} GOOS=linux go build -trimpath -tags=disable_pgv,agent \
           -ldflags="-X github.com/agentgateway/agentgateway/controller/pkg/version.Version=${{ env.VERSION }} -s -w" \
           -o _output/pkg/agentgateway/agentgateway-linux-${{ matrix.goarch }} \
           ./cmd/agentgateway

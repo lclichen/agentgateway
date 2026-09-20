@@ -815,7 +815,18 @@ pub mod from_messages {
 				.map(Into::into)
 		};
 
-		let output_effort = output_config.as_ref().and_then(|cfg| cfg.effort);
+		let output_effort = output_config
+			.as_ref()
+			.and_then(|cfg| cfg.effort)
+			.or_else(|| {
+				if let Some(messages::ThinkingInput::Enabled { budget_tokens }) = &thinking {
+					Some(crate::types::anthropic_effort_for_thinking_budget(
+						*budget_tokens,
+					))
+				} else {
+					None
+				}
+			});
 		let reasoning_requested = match thinking {
 			Some(messages::ThinkingInput::Disabled {}) => false,
 			Some(messages::ThinkingInput::Adaptive {}) => true,

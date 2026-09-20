@@ -505,7 +505,11 @@ func ListenerSetBuilder(
 	}
 
 	pns := ptr.OrDefault(p.Namespace, gwv1.Namespace(obj.Namespace))
-	parentGwObj := ptr.Flatten(krt.FetchOne(ctx, gateways, krt.FilterKey(string(pns)+"/"+string(p.Name))))
+	// ListenerSet translation depends on the parent Gateway's spec, name, and namespace.
+	parentGwObj := krtutil.FetchOneSpec(ctx, gateways,
+		func(gw *gwv1.Gateway) gwv1.GatewaySpec { return gw.Spec },
+		krt.FilterKey(string(pns)+"/"+string(p.Name)),
+	)
 	if parentGwObj == nil {
 		// Cannot report status since we don't know if it is for us
 		return nil, nil
@@ -520,7 +524,7 @@ func ListenerSetBuilder(
 		return nil, nil // ignore gateways not managed by our controller
 	}
 
-	if !NamespaceAcceptedByAllowListeners(obj.Namespace, parentGwObj, func(s string) *corev1.Namespace {
+	if !AllowedListenersAcceptNamespace(parentGwObj.Spec.AllowedListeners, obj.Namespace, parentGwObj.Namespace, func(s string) *corev1.Namespace {
 		return ptr.Flatten(krt.FetchOne(ctx, namespaces, krt.FilterKey(s)))
 	}) {
 		reportNotAllowedListenerSet(status, obj)
@@ -558,7 +562,7 @@ func ListenerSetBuilder(
 
 		allowed, _ := GenerateSupportedKinds(standardListener, enableAgentgatewayModels)
 		pri := ParentInfo{
-			ParentGateway:     config.NamespacedName(parentGwObj),
+			ParentGateway:     parentGwObj.NamespacedName,
 			ListenerKey:       name,
 			AllowedKinds:      allowed,
 			Hostnames:         hostnames,
@@ -576,7 +580,7 @@ func ListenerSetBuilder(
 			Valid:         programmed,
 			TLSInfo:       tlsInfo,
 			Parent:        config.NamespacedName(obj),
-			GatewayParent: config.NamespacedName(parentGwObj),
+			GatewayParent: parentGwObj.NamespacedName,
 			ListenerIndex: i,
 			ParentInfo:    pri,
 		}
@@ -658,9 +662,14 @@ func BuildRouteParents(
 	}
 }
 
-// NamespaceAcceptedByAllowListeners determines a list of allowed namespaces for a given AllowedListener
-func NamespaceAcceptedByAllowListeners(localNamespace string, parent *gwv1.Gateway, lookupNamespace func(string) *corev1.Namespace) bool {
-	lr := parent.Spec.AllowedListeners
+// AllowedListenersAcceptNamespace takes the policy as an argument rather than reading
+// spec.allowedListeners, so callers can supply one for Gateways whose CRD predates the field.
+func AllowedListenersAcceptNamespace(
+	lr *gwv1.AllowedListeners,
+	localNamespace string,
+	parentNamespace string,
+	lookupNamespace func(string) *corev1.Namespace,
+) bool {
 	// Default allows none
 	if lr == nil || lr.Namespaces == nil {
 		return false
@@ -671,7 +680,7 @@ func NamespaceAcceptedByAllowListeners(localNamespace string, parent *gwv1.Gatew
 		case gwv1.NamespacesFromAll:
 			return true
 		case gwv1.NamespacesFromSame:
-			return localNamespace == parent.Namespace
+			return localNamespace == parentNamespace
 		case gwv1.NamespacesFromNone:
 			return false
 		case gwv1.NamespacesFromSelector:

@@ -43,6 +43,30 @@ mod tests {
 	use super::tool_arguments_to_input;
 
 	#[test]
+	fn thinking_budget_buckets() {
+		use crate::types::messages::typed::ThinkingEffort::{High, Low, Max, Medium, Xhigh};
+		for (budget, expected) in [
+			(0, Low),
+			(1024, Low),
+			(2047, Low),
+			(2048, Medium),
+			(4095, Medium),
+			(4096, High),
+			(8191, High),
+			(8192, Xhigh),
+			(16383, Xhigh),
+			(16384, Max),
+			(u64::MAX, Max),
+		] {
+			assert_eq!(
+				crate::types::anthropic_effort_for_thinking_budget(budget),
+				expected,
+				"budget {budget}"
+			);
+		}
+	}
+
+	#[test]
 	fn empty_arguments_become_an_empty_object() {
 		assert_eq!(tool_arguments_to_input(""), json!({}));
 	}

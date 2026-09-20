@@ -1858,7 +1858,7 @@ fn messages_to_responses_maps_anthropic_runtime_features() {
 	let body: Value = serde_json::from_slice(&body).expect("translated request should be JSON");
 
 	assert!(body.get("context_management").is_none());
-	assert_eq!(body["reasoning"]["effort"], "high");
+	assert_eq!(body["reasoning"]["effort"], "medium");
 	assert_eq!(body["input"][0]["role"], "system");
 	assert_eq!(
 		body["input"][0]["content"][1]["prompt_cache_breakpoint"]["mode"],

@@ -448,6 +448,9 @@ pub struct CostRates {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[dynamic(rename = "outputAudio")]
 	pub output_audio: Option<f64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[dynamic(rename = "perPage")]
+	pub per_page: Option<f64>,
 }
 
 impl From<&Rates> for CostRates {
@@ -461,6 +464,7 @@ impl From<&Rates> for CostRates {
 			reasoning: f(&r.reasoning),
 			input_audio: f(&r.input_audio),
 			output_audio: f(&r.output_audio),
+			per_page: f(&r.per_page),
 		}
 	}
 }
@@ -471,7 +475,7 @@ fn breakdown_f64(d: Decimal) -> f64 {
 
 impl Breakdown {
 	// (CEL field name, value) pairs. `total` is computed, the rest are stored.
-	fn components(&self) -> [(&'static str, Decimal); 8] {
+	fn components(&self) -> [(&'static str, Decimal); 9] {
 		[
 			("total", self.total()),
 			("input", self.input),
@@ -481,6 +485,7 @@ impl Breakdown {
 			("reasoning", self.reasoning),
 			("inputAudio", self.input_audio),
 			("outputAudio", self.output_audio),
+			("pages", self.pages),
 		]
 	}
 }
@@ -500,6 +505,7 @@ pub struct CostBreakdown {
 	pub input_audio: f64,
 	#[dynamic(rename = "outputAudio")]
 	pub output_audio: f64,
+	pub pages: f64,
 }
 
 impl From<&Breakdown> for CostBreakdown {
@@ -513,6 +519,7 @@ impl From<&Breakdown> for CostBreakdown {
 			reasoning: breakdown_f64(b.reasoning),
 			input_audio: breakdown_f64(b.input_audio),
 			output_audio: breakdown_f64(b.output_audio),
+			pages: breakdown_f64(b.pages),
 		}
 	}
 }
@@ -528,13 +535,14 @@ impl From<CostBreakdown> for Breakdown {
 			reasoning: d(b.reasoning),
 			input_audio: d(b.input_audio),
 			output_audio: d(b.output_audio),
+			pages: d(b.pages),
 		}
 	}
 }
 
 impl ::cel::types::dynamic::DynamicType for Breakdown {
 	fn materialize(&self) -> ::cel::Value<'_> {
-		let mut map = vector_map::VecMap::with_capacity(8);
+		let mut map = vector_map::VecMap::with_capacity(9);
 		for (name, value) in self.components() {
 			map.insert(
 				::cel::objects::KeyRef::from(name),
@@ -740,6 +748,8 @@ fn usage_for(
 		reasoning,
 		input_audio,
 		output_audio,
+		// Pages are billed as pages, so they skip the cache-convention token arithmetic above.
+		pages: resp.pages.unwrap_or(0),
 	}
 }
 
@@ -1074,6 +1084,29 @@ mod tests {
 		);
 		assert_eq!(status, CostLookupStatus::Exact);
 		assert_eq!(cost, Some(2.0));
+	}
+
+	#[test]
+	fn prices_a_page_billed_model_with_no_token_rates() {
+		// Document OCR: the entry carries only `perPage`, priced per single page
+		let snap = CatalogSnapshot::parse(
+			r#"{"providers":{"mistral":{"models":{
+				"my-model":{"rates":{"perPage":"0.005"}}
+			}}}}"#,
+		)
+		.unwrap();
+		let resp = LLMResponse {
+			pages: Some(4),
+			..Default::default()
+		};
+		let (cost, status) = snap.price(
+			"mistral",
+			"my-model",
+			&resp,
+			CacheTokenConvention::InputIncludesCache,
+		);
+		assert_eq!(status, CostLookupStatus::Exact);
+		assert_eq!(cost, Some(0.02));
 	}
 
 	#[test]
