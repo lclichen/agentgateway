@@ -867,7 +867,12 @@ function ModelMetadataSection(props: {
 	onChange: (metadata: LlmModel['metadata']) => void;
 }) {
 	const metadata = props.metadata ?? {};
-	const modalitiesText = (values: string[] | null | undefined) => (values ?? []).join(', ');
+	const MODALITY_OPTIONS = [
+		{ value: 'text', label: 'Text' },
+		{ value: 'image', label: 'Image' },
+		{ value: 'audio', label: 'Audio' },
+		{ value: 'video', label: 'Video' }
+	];
 	function update(patch: Partial<NonNullable<LlmModel['metadata']>>) {
 		const next: Record<string, unknown> = { ...metadata };
 		for (const [key, value] of Object.entries(patch)) {
@@ -882,24 +887,52 @@ function ModelMetadataSection(props: {
 		const parsed = Number(trimmed);
 		return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : null;
 	}
-	function modalitiesOrNull(value: string) {
-		const items = value
-			.split(',')
-			.map(item => item.trim())
-			.filter(Boolean);
-		return items.length ? items : null;
+	function ModalityChips(propsChips: {
+		label: string;
+		values: string[] | null | undefined;
+		onChange: (values: string[] | null) => void;
+	}) {
+		const selected = new Set(propsChips.values ?? []);
+		function toggle(value: string) {
+			const next = new Set(selected);
+			if (next.has(value)) next.delete(value);
+			else next.add(value);
+			const ordered = MODALITY_OPTIONS.filter(option => next.has(option.value)).map(
+				option => option.value
+			);
+			propsChips.onChange(ordered.length ? ordered : null);
+		}
+		return (
+			<Field label={propsChips.label}>
+				<div className="segmented-control" role="group">
+					{MODALITY_OPTIONS.map(option => (
+						<button
+							key={option.value}
+							type="button"
+							aria-pressed={selected.has(option.value)}
+							className={selected.has(option.value) ? 'active' : ''}
+							onClick={() => toggle(option.value)}
+						>
+							{option.label}
+						</button>
+					))}
+				</div>
+			</Field>
+		);
 	}
 	return (
 		<div className="policy-editor-stack">
-			<Field label="Context length (tokens)">
-				<input
-					type="number"
-					min={1}
-					value={metadata.contextLength ?? ''}
-					onChange={event => update({ contextLength: numberOrNull(event.target.value) })}
-					placeholder="131072"
-				/>
-			</Field>
+			<div className="button-row">
+				<Field label="Context length (tokens)">
+					<input
+						type="number"
+						min={1}
+						value={metadata.contextLength ?? ''}
+						onChange={event => update({ contextLength: numberOrNull(event.target.value) })}
+						placeholder="131072"
+					/>
+				</Field>
+			</div>
 			<Field label="Max output tokens">
 				<input
 					type="number"
@@ -909,20 +942,16 @@ function ModelMetadataSection(props: {
 					placeholder="16384"
 				/>
 			</Field>
-			<Field label="Input modalities (comma separated)">
-				<input
-					value={modalitiesText(metadata.inputModalities)}
-					onChange={event => update({ inputModalities: modalitiesOrNull(event.target.value) })}
-					placeholder="text, image"
-				/>
-			</Field>
-			<Field label="Output modalities (comma separated)">
-				<input
-					value={modalitiesText(metadata.outputModalities)}
-					onChange={event => update({ outputModalities: modalitiesOrNull(event.target.value) })}
-					placeholder="text"
-				/>
-			</Field>
+			<ModalityChips
+				label="Input modalities"
+				values={metadata.inputModalities}
+				onChange={inputModalities => update({ inputModalities })}
+			/>
+			<ModalityChips
+				label="Output modalities"
+				values={metadata.outputModalities}
+				onChange={outputModalities => update({ outputModalities })}
+			/>
 		</div>
 	);
 }
