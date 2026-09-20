@@ -780,6 +780,17 @@ function ModelEditor(props: {
 					/>
 
 					<CollapsiblePolicySection
+						icon={<Activity size={17} />}
+						title="Model metadata"
+						description="Capabilities and limits advertised on the model list API (/v1/models)"
+					>
+						<ModelMetadataSection
+							metadata={model.metadata}
+							onChange={metadata => setModel(current => ({ ...current, metadata }))}
+						/>
+					</CollapsiblePolicySection>
+
+					<CollapsiblePolicySection
 						icon={<SlidersHorizontal size={17} />}
 						title="Advanced"
 						description="Match conditions and model-specific policies"
@@ -850,6 +861,71 @@ function ModelEditor(props: {
 }
 
 type UpstreamModelMode = 'incoming' | 'explicit' | 'strip' | 'custom';
+
+function ModelMetadataSection(props: {
+	metadata: LlmModel['metadata'];
+	onChange: (metadata: LlmModel['metadata']) => void;
+}) {
+	const metadata = props.metadata ?? {};
+	const modalitiesText = (values: string[] | null | undefined) => (values ?? []).join(', ');
+	function update(patch: Partial<NonNullable<LlmModel['metadata']>>) {
+		const next: Record<string, unknown> = { ...metadata };
+		for (const [key, value] of Object.entries(patch)) {
+			if (value == null || (Array.isArray(value) && value.length === 0)) delete next[key];
+			else next[key] = value;
+		}
+		props.onChange(Object.keys(next).length ? (next as NonNullable<LlmModel['metadata']>) : null);
+	}
+	function numberOrNull(value: string) {
+		const trimmed = value.trim();
+		if (!trimmed) return null;
+		const parsed = Number(trimmed);
+		return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : null;
+	}
+	function modalitiesOrNull(value: string) {
+		const items = value
+			.split(',')
+			.map(item => item.trim())
+			.filter(Boolean);
+		return items.length ? items : null;
+	}
+	return (
+		<div className="policy-editor-stack">
+			<Field label="Context length (tokens)">
+				<input
+					type="number"
+					min={1}
+					value={metadata.contextLength ?? ''}
+					onChange={event => update({ contextLength: numberOrNull(event.target.value) })}
+					placeholder="131072"
+				/>
+			</Field>
+			<Field label="Max output tokens">
+				<input
+					type="number"
+					min={1}
+					value={metadata.maxOutputTokens ?? ''}
+					onChange={event => update({ maxOutputTokens: numberOrNull(event.target.value) })}
+					placeholder="16384"
+				/>
+			</Field>
+			<Field label="Input modalities (comma separated)">
+				<input
+					value={modalitiesText(metadata.inputModalities)}
+					onChange={event => update({ inputModalities: modalitiesOrNull(event.target.value) })}
+					placeholder="text, image"
+				/>
+			</Field>
+			<Field label="Output modalities (comma separated)">
+				<input
+					value={modalitiesText(metadata.outputModalities)}
+					onChange={event => update({ outputModalities: modalitiesOrNull(event.target.value) })}
+					placeholder="text"
+				/>
+			</Field>
+		</div>
+	);
+}
 
 function UpstreamModelFields(props: {
 	mode: UpstreamModelMode;
