@@ -1,9 +1,9 @@
 name: Build Linux x64 binary
 
 # Personal fork helper: builds the standalone gateway (UI embedded) for
-# linux x64 pinned to older glibc versions and uploads the binaries as
-# workflow artifacts. The glibc 2.17 build runs on any distro with
-# glibc >= 2.17 (CentOS/RHEL 7+, and therefore also 2.28 systems).
+# linux x64 inside manylinux containers with NATIVE toolchains, so the
+# resulting binaries are compatible with old glibc versions without
+# cross-compiler surprises. Also uploads the ui/dist payload separately.
 on:
   workflow_dispatch: {}
 
@@ -11,51 +11,121 @@ permissions:
   contents: read
 
 jobs:
-  build-linux-x64:
+  build-ui:
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        glibc: ["2.17", "2.28"]
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: pnpm/action-setup@v4
         with:
           version: 11.20.0
-
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-
-      - name: Build UI (embedded into the binary)
+      - name: Build UI
         working-directory: ui
         run: |
           pnpm install --frozen-lockfile
           pnpm build
-
-      - name: Install cargo-zigbuild (glibc-version-pinned cross builds)
-        run: pip3 install cargo-zigbuild
-
-      - name: Add gnu target
-        run: rustup target add x86_64-unknown-linux-gnu
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            .
-          key: glibc-${{ matrix.glibc }}
-
-      - name: Build gateway (release, glibc ${{ matrix.glibc }}, UI embedded)
-        run: cargo zigbuild --release --target x86_64-unknown-linux-gnu.${{ matrix.glibc }} -p agentgateway-app --features ui
-
-      - name: Rename binary
-        run: cp target/x86_64-unknown-linux-gnu/release/agentgateway agentgateway-linux-x64-glibc${{ matrix.glibc }}
-
-      - name: Upload artifact
+      - name: Upload ui/dist
+        id: upload
         uses: actions/upload-artifact@v4
         with:
-          name: agentgateway-linux-x64-glibc${{ matrix.glibc }}
-          path: agentgateway-linux-x64-glibc${{ matrix.glibc }}
+          name: ui-dist
+          path: ui/dist
           if-no-files-found: error
+
+  build-glibc-2-28:
+    runs-on: ubuntu-24.04
+    needs: build-ui
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: dnf install -y cmake perl unzip && dnf clean all
+      - name: Download ui/dist
+        run: |
+          SIGNED=$(curl -sS -o /dev/null -w '%{redirect_url}' \
+            -H "Authorization: token ${{ github.token }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${{ needs.build-ui.outputs.artifact_id }}/zip")
+          test -n "$SIGNED"
+          curl -sSL -o ui-dist.zip "$SIGNED"
+          unzip -q ui-dist.zip -d ui/dist
+      - name: Install Rust toolchain
+        run: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+          . "$HOME/.cargo/env"
+          rustup --version
+      - name: Build gateway (release, glibc 2.28, UI embedded)
+        run: |
+          . "$HOME/.cargo/env"
+          cargo build --release -p agentgateway-app --features ui
+      - name: Report glibc symbol floor
+        run: |
+          echo "highest GLIBC symbol version referenced:"
+          objdump -T target/release/agentgateway | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+      - name: Rename binary
+        run: cp target/release/agentgateway agentgateway-linux-x64-glibc2.28
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentgateway-linux-x64-glibc2.28
+          path: agentgateway-linux-x64-glibc2.28
+          if-no-files-found: error
+
+  build-glibc-2-17:
+    runs-on: ubuntu-24.04
+    needs: build-ui
+    permissions:
+      contents: write
+    container:
+      image: quay.io/pypa/manylinux2014_x86_64
+    steps:
+      # actions/checkout needs a newer node/glibc than this container has;
+      # clone with the container's own git instead.
+      - name: Checkout
+        shell: bash
+        run: |
+          git clone --depth 1 --branch "${{ github.ref_name }}" \
+            "${{ github.server_url }}/${{ github.repository }}.git" .
+      - name: Install build tools
+        run: yum install -y cmake3 unzip perl-core && ln -sf /usr/bin/cmake3 /usr/local/bin/cmake
+      - name: Download ui/dist
+        run: |
+          SIGNED=$(curl -sS -o /dev/null -w '%{redirect_url}' \
+            -H "Authorization: token ${{ github.token }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${{ needs.build-ui.outputs.artifact_id }}/zip")
+          test -n "$SIGNED"
+          curl -sSL -o ui-dist.zip "$SIGNED"
+          unzip -q ui-dist.zip -d ui/dist
+      - name: Install Rust toolchain
+        run: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+          . "$HOME/.cargo/env"
+          rustup --version
+      - name: Build gateway (release, glibc 2.17, UI embedded)
+        run: |
+          . "$HOME/.cargo/env"
+          cargo build --release -p agentgateway-app --features ui
+      - name: Report glibc symbol floor
+        run: |
+          echo "highest GLIBC symbol version referenced:"
+          objdump -T target/release/agentgateway | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+      - name: Rename binary
+        run: cp target/release/agentgateway agentgateway-linux-x64-glibc2.17
+      # upload-artifact needs node24 (glibc 2.28+), unavailable in this container;
+      # push the binary to an artifacts branch with the container's own git instead.
+      - name: Push binary to artifacts branch
+        run: |
+          unset GIT_DIR GIT_WORK_TREE
+          cd "${GITHUB_WORKSPACE}"
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          git config user.email "actions@github.com"
+          git config user.name "artifact-bot"
+          git checkout -b artifacts/glibc2.17
+          git add agentgateway-linux-x64-glibc2.17
+          git commit -m "artifact: glibc 2.17 build of ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" artifacts/glibc2.17
+      - name: Print raw download URL
+        run: echo "https://raw.githubusercontent.com/${{ github.repository }}/artifacts/glibc2.17/agentgateway-linux-x64-glibc2.17"
