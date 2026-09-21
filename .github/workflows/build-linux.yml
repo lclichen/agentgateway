@@ -44,7 +44,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install build tools
-        run: dnf install -y cmake perl-Core unzip && dnf clean all
+        run: dnf install -y cmake perl unzip && dnf clean all
       - name: Download ui/dist
         run: |
           curl -sL -H "Authorization: token ${{ github.token }}" -o ui-dist.zip \
@@ -85,7 +85,7 @@ jobs:
           git clone --depth 1 --branch "${{ github.ref_name }}" \
             "${{ github.server_url }}/${{ github.repository }}.git" .
       - name: Install build tools
-        run: yum install -y cmake3 unzip perl-Core && ln -sf /usr/bin/cmake3 /usr/local/bin/cmake
+        run: yum install -y cmake3 unzip perl-core && ln -sf /usr/bin/cmake3 /usr/local/bin/cmake
       - name: Download ui/dist
         run: |
           curl -sL -H "Authorization: token ${{ github.token }}" -o ui-dist.zip \
