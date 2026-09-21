@@ -47,8 +47,11 @@ jobs:
         run: dnf install -y cmake perl unzip && dnf clean all
       - name: Download ui/dist
         run: |
-          curl -sL -H "Authorization: token ${{ github.token }}" -o ui-dist.zip \
-            "https://github.com/${{ github.repository }}/actions/artifacts/${{ needs.build-ui.outputs.artifact_id }}?archive=zip"
+          SIGNED=$(curl -sS -o /dev/null -w '%{redirect_url}' \
+            -H "Authorization: token ${{ github.token }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${{ needs.build-ui.outputs.artifact_id }}/zip")
+          test -n "$SIGNED"
+          curl -sSL -o ui-dist.zip "$SIGNED"
           unzip -q ui-dist.zip -d ui/dist
       - name: Install Rust toolchain
         run: |
@@ -88,8 +91,11 @@ jobs:
         run: yum install -y cmake3 unzip perl-core && ln -sf /usr/bin/cmake3 /usr/local/bin/cmake
       - name: Download ui/dist
         run: |
-          curl -sL -H "Authorization: token ${{ github.token }}" -o ui-dist.zip \
-            "https://github.com/${{ github.repository }}/actions/artifacts/${{ needs.build-ui.outputs.artifact_id }}?archive=zip"
+          SIGNED=$(curl -sS -o /dev/null -w '%{redirect_url}' \
+            -H "Authorization: token ${{ github.token }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${{ needs.build-ui.outputs.artifact_id }}/zip")
+          test -n "$SIGNED"
+          curl -sSL -o ui-dist.zip "$SIGNED"
           unzip -q ui-dist.zip -d ui/dist
       - name: Install Rust toolchain
         run: |
