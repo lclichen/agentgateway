@@ -1,7 +1,9 @@
 name: Build Linux x64 binary
 
 # Personal fork helper: builds the standalone gateway (UI embedded) for
-# linux x64 and uploads the binary as a workflow artifact.
+# linux x64 inside manylinux containers with NATIVE toolchains, so the
+# resulting binaries are compatible with old glibc versions without
+# cross-compiler surprises. Also uploads the ui/dist payload separately.
 on:
   workflow_dispatch: {}
 
@@ -9,40 +11,103 @@ permissions:
   contents: read
 
 jobs:
-  build-linux-x64:
+  build-ui:
     runs-on: ubuntu-24.04
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: pnpm/action-setup@v4
         with:
           version: 11.20.0
-
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-
-      - name: Build UI (embedded into the binary)
+      - name: Build UI
         working-directory: ui
         run: |
           pnpm install --frozen-lockfile
           pnpm build
-
-      - name: Install Rust toolchain (pinned by rust-toolchain.toml)
-        run: rustup toolchain install --profile minimal
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            .
-
-      - name: Build gateway (release, UI embedded)
-        run: cargo build --release -p agentgateway-app --features ui
-
-      - name: Upload artifact
+      - name: Upload ui/dist
+        id: upload
         uses: actions/upload-artifact@v4
         with:
-          name: agentgateway-linux-x64
-          path: target/release/agentgateway
+          name: ui-dist
+          path: ui/dist
+          if-no-files-found: error
+
+  build-glibc-2-28:
+    runs-on: ubuntu-24.04
+    needs: build-ui
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: dnf install -y cmake perl-Core unzip && dnf clean all
+      - name: Download ui/dist
+        run: |
+          curl -sL -H "Authorization: token ${{ github.token }}" -o ui-dist.zip \
+            "https://github.com/${{ github.repository }}/actions/artifacts/${{ needs.build-ui.outputs.artifact_id }}?archive=zip"
+          unzip -q ui-dist.zip -d ui/dist
+      - name: Install Rust toolchain
+        run: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+          . "$HOME/.cargo/env"
+          rustup --version
+      - name: Build gateway (release, glibc 2.28, UI embedded)
+        run: |
+          . "$HOME/.cargo/env"
+          cargo build --release -p agentgateway-app --features ui
+      - name: Report glibc symbol floor
+        run: |
+          echo "highest GLIBC symbol version referenced:"
+          objdump -T target/release/agentgateway | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+      - name: Rename binary
+        run: cp target/release/agentgateway agentgateway-linux-x64-glibc2.28
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentgateway-linux-x64-glibc2.28
+          path: agentgateway-linux-x64-glibc2.28
+          if-no-files-found: error
+
+  build-glibc-2-17:
+    runs-on: ubuntu-24.04
+    needs: build-ui
+    container:
+      image: quay.io/pypa/manylinux2014_x86_64
+    steps:
+      # actions/checkout needs a newer node/glibc than this container has;
+      # clone with the container's own git instead.
+      - name: Checkout
+        shell: bash
+        run: |
+          git clone --depth 1 --branch "${{ github.ref_name }}" \
+            "${{ github.server_url }}/${{ github.repository }}.git" .
+      - name: Install build tools
+        run: yum install -y cmake3 unzip perl-Core && ln -sf /usr/bin/cmake3 /usr/local/bin/cmake
+      - name: Download ui/dist
+        run: |
+          curl -sL -H "Authorization: token ${{ github.token }}" -o ui-dist.zip \
+            "https://github.com/${{ github.repository }}/actions/artifacts/${{ needs.build-ui.outputs.artifact_id }}?archive=zip"
+          unzip -q ui-dist.zip -d ui/dist
+      - name: Install Rust toolchain
+        run: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+          . "$HOME/.cargo/env"
+          rustup --version
+      - name: Build gateway (release, glibc 2.17, UI embedded)
+        run: |
+          . "$HOME/.cargo/env"
+          cargo build --release -p agentgateway-app --features ui
+      - name: Report glibc symbol floor
+        run: |
+          echo "highest GLIBC symbol version referenced:"
+          objdump -T target/release/agentgateway | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+      - name: Rename binary
+        run: cp target/release/agentgateway agentgateway-linux-x64-glibc2.17
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentgateway-linux-x64-glibc2.17
+          path: agentgateway-linux-x64-glibc2.17
           if-no-files-found: error
