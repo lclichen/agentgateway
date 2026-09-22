@@ -118,6 +118,9 @@ jobs:
       # push the binary to an artifacts branch with the container's own git instead.
       - name: Push binary to artifacts branch
         run: |
+          unset GIT_DIR GIT_WORK_TREE
+          cd "${GITHUB_WORKSPACE}"
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
           git config user.email "actions@github.com"
           git config user.name "artifact-bot"
           git checkout -b artifacts/glibc2.17
