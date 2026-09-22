@@ -77,6 +77,8 @@ jobs:
   build-glibc-2-17:
     runs-on: ubuntu-24.04
     needs: build-ui
+    permissions:
+      contents: write
     container:
       image: quay.io/pypa/manylinux2014_x86_64
     steps:
@@ -112,8 +114,15 @@ jobs:
           objdump -T target/release/agentgateway | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
       - name: Rename binary
         run: cp target/release/agentgateway agentgateway-linux-x64-glibc2.17
-      - uses: actions/upload-artifact@v4
-        with:
-          name: agentgateway-linux-x64-glibc2.17
-          path: agentgateway-linux-x64-glibc2.17
-          if-no-files-found: error
+      # upload-artifact needs node24 (glibc 2.28+), unavailable in this container;
+      # push the binary to an artifacts branch with the container's own git instead.
+      - name: Push binary to artifacts branch
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "artifact-bot"
+          git checkout -b artifacts/glibc2.17
+          git add agentgateway-linux-x64-glibc2.17
+          git commit -m "artifact: glibc 2.17 build of ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" artifacts/glibc2.17
+      - name: Print raw download URL
+        run: echo "https://raw.githubusercontent.com/${{ github.repository }}/artifacts/glibc2.17/agentgateway-linux-x64-glibc2.17"
