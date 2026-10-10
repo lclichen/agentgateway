@@ -2037,6 +2037,46 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn key_hash_api_keys_round_trip_without_plaintext() {
+		// Platform-managed keys are declared as `keyHash` only; nothing on the write or
+		// read path may synthesize, store, or echo a recoverable plaintext `key` field.
+		let key_hash = "sha256:4c806362b613f7496abf284146efd31da90e4b16169fe001841ca17290f427c9";
+		let prepared = prepare_resource(
+			ConfigResourceKind::LlmApiKey,
+			json!({"keyHash": key_hash, "metadata": {"name": "platform-key"}}),
+		)
+		.expect("prepare keyHash-only api key");
+		assert!(
+			prepared.value.get("key").is_none(),
+			"prepared keyHash key must not gain a plaintext field"
+		);
+
+		let store = ConfigResourceStore::connect("sqlite::memory:", None)
+			.await
+			.expect("connect config resource store");
+		store
+			.upsert_prepared(vec![prepared])
+			.await
+			.expect("upsert api key");
+
+		let listed = store
+			.list(Some(ConfigResourceKind::LlmApiKey))
+			.await
+			.expect("list api keys");
+		assert_eq!(listed.len(), 1);
+		let value = &listed[0].value;
+		assert_eq!(
+			value.get("keyHash"),
+			Some(&Value::String(key_hash.to_string())),
+			"keyHash must round-trip verbatim"
+		);
+		assert!(
+			value.get("key").is_none(),
+			"no plaintext key may be echoed for keyHash-declared keys"
+		);
+	}
+
+	#[tokio::test]
 	async fn renames_resources_atomically() {
 		let store = ConfigResourceStore::connect("sqlite::memory:", None)
 			.await
