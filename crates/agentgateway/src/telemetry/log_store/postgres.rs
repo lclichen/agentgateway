@@ -262,6 +262,7 @@ impl PostgresLogStore {
 			 COALESCE(SUM(total_tokens), 0)::BIGINT AS total_tokens, \
 			 COALESCE(SUM(cost), 0.0)::DOUBLE PRECISION AS cost, \
 			 SUM(CASE WHEN http_status >= 400 THEN 1 ELSE 0 END) AS errors, \
+			 MAX(agentgateway_user) AS session_user, \
 			 MIN(id) AS first_log_id, MAX(id) AS last_log_id \
 			 FROM request_logs WHERE agentgateway_session IS NOT NULL AND agentgateway_session != ''",
 		);
@@ -287,6 +288,7 @@ impl PostgresLogStore {
 			total_tokens: i64,
 			cost: f64,
 			errors: i64,
+			user: Option<String>,
 			first_log_id: String,
 			last_log_id: String,
 		}
@@ -300,6 +302,7 @@ impl PostgresLogStore {
 				total_tokens: row.try_get("total_tokens")?,
 				cost: row.try_get("cost")?,
 				errors: row.try_get("errors")?,
+				user: row.try_get("session_user")?,
 				first_log_id: row.try_get("first_log_id")?,
 				last_log_id: row.try_get("last_log_id")?,
 			});
@@ -346,6 +349,7 @@ impl PostgresLogStore {
 				total_tokens: s.total_tokens,
 				cost: s.cost,
 				errors: s.errors,
+				user: s.user,
 				last_log_id: Some(s.last_log_id),
 			})
 			.collect();
