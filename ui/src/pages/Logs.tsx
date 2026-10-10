@@ -117,6 +117,7 @@ export function LogsPage() {
 		emptyAnalyticsFilterOptions
 	);
 	const [status, setStatus] = useState('');
+	const [sessionFilter, setSessionFilter] = useState('');
 	const [stream, setStream] = useState(false);
 	const [response, setResponse] = useState<SearchLogsResponse>({ logs: [] });
 	const [expanded, setExpanded] = useState<LogEntry | null>(null);
@@ -131,13 +132,15 @@ export function LogsPage() {
 	const filterOptionsSeqRef = useRef(0);
 	const logFiltersKey = analyticsFiltersKey(logFilters);
 	// biome-ignore lint/correctness/useExhaustiveDependencies: Existing lint violation; remove this suppression when the underlying issue is fixed.
-	const filters = useMemo(
-		() => ({
-			...analyticsLogFilters(logFilters),
-			httpStatus: status ? [Number(status)] : []
-		}),
-		[logFiltersKey, status]
-	);
+	const filters = useMemo(() => {
+		const base = analyticsLogFilters(logFilters);
+		const session = sessionFilter.trim();
+		return {
+			...base,
+			httpStatus: status ? [Number(status)] : [],
+			...(session ? { attributes: { ...base.attributes, 'agentgateway.session': session } } : {})
+		};
+	}, [logFiltersKey, status, sessionFilter]);
 	const visibleLogs = useMemo(() => {
 		if (!expanded || !expandedId || response.logs.some(entry => entry.id === expandedId))
 			return response.logs;
@@ -167,7 +170,8 @@ export function LogsPage() {
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: Existing lint violation; remove this suppression when the underlying issue is fixed.
 	useEffect(() => {
-		void load();
+		const timer = setTimeout(() => void load(), sessionFilter ? 300 : 0);
+		return () => clearTimeout(timer);
 	}, [filters]);
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: Existing lint violation; remove this suppression when the underlying issue is fixed.
@@ -385,6 +389,15 @@ export function LogsPage() {
 						allLabel="Any status"
 						onChange={values => setStatus(values.at(-1) ?? '')}
 					/>
+					<FieldGroup label="Session">
+						<input
+							type="text"
+							value={sessionFilter}
+							placeholder="Session id"
+							spellCheck={false}
+							onChange={event => setSessionFilter(event.target.value)}
+						/>
+					</FieldGroup>
 					<label className="toggle-row logs-stream-toggle">
 						<input
 							type="checkbox"
@@ -393,13 +406,14 @@ export function LogsPage() {
 						/>
 						Stream
 					</label>
-					{hasAnalyticsFilters(logFilters) || status ? (
+					{hasAnalyticsFilters(logFilters) || status || sessionFilter ? (
 						<button
 							className="button"
 							type="button"
 							onClick={() => {
 								setLogFilters(emptyAnalyticsFilterOptions());
 								setStatus('');
+								setSessionFilter('');
 							}}
 						>
 							Clear filters
