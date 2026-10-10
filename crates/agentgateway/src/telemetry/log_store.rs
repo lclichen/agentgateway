@@ -589,6 +589,8 @@ pub struct SessionSummary {
 	pub total_tokens: i64,
 	pub cost: f64,
 	pub errors: i64,
+	/// Attributed user (aggregated with MAX); a session spanning several users reports only one.
+	pub user: Option<String>,
 	/// Preview of the first user prompt seen in this session.
 	pub title: Option<String>,
 	/// Log id of the most recent request in this session.
