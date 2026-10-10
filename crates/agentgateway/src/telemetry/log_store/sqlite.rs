@@ -335,6 +335,7 @@ impl SqliteLogStore {
 			 MAX(completed_at) AS last_seen, COUNT(*) AS requests, \
 			 COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(cost), 0.0) AS cost, \
 			 SUM(CASE WHEN http_status >= 400 THEN 1 ELSE 0 END) AS errors, \
+			 MAX(agentgateway_user) AS session_user, \
 			 MIN(id) AS first_log_id, MAX(id) AS last_log_id \
 			 FROM request_logs WHERE agentgateway_session IS NOT NULL AND agentgateway_session != ''",
 		);
@@ -362,6 +363,7 @@ impl SqliteLogStore {
 			total_tokens: i64,
 			cost: f64,
 			errors: i64,
+			user: Option<String>,
 			first_log_id: String,
 			last_log_id: String,
 		}
@@ -375,6 +377,7 @@ impl SqliteLogStore {
 				total_tokens: row.try_get("total_tokens")?,
 				cost: row.try_get("cost")?,
 				errors: row.try_get("errors")?,
+				user: row.try_get("session_user")?,
 				first_log_id: row.try_get("first_log_id")?,
 				last_log_id: row.try_get("last_log_id")?,
 			});
@@ -421,6 +424,7 @@ impl SqliteLogStore {
 				total_tokens: s.total_tokens,
 				cost: s.cost,
 				errors: s.errors,
+				user: s.user,
 				last_log_id: Some(s.last_log_id),
 			})
 			.collect();
@@ -1018,6 +1022,87 @@ mod tests {
 		assert_eq!(by_id("0001").session.as_deref(), Some("session-a"));
 		assert_eq!(by_id("0003").session.as_deref(), Some("session-b"));
 		assert_eq!(by_id("0004").session, None);
+	}
+
+	#[tokio::test]
+	async fn search_sessions_reports_user_and_filters_by_user() {
+		let store = SqliteLogStore::from_pool(memory_pool().await)
+			.await
+			.unwrap();
+		let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+		let mut a1 = sample("0001", Some("session-a"), base, None);
+		a1.agentgateway_user = Some("alice".to_string());
+		let mut a2 = sample(
+			"0002",
+			Some("session-a"),
+			base + chrono::Duration::seconds(10),
+			None,
+		);
+		a2.agentgateway_user = Some("alice".to_string());
+		let mut b = sample("0003", Some("session-b"), base + chrono::Duration::seconds(5), None);
+		b.agentgateway_user = Some("bob".to_string());
+		// session-c spans two users; the aggregate reports only one of them.
+		let mut c1 = sample(
+			"0004",
+			Some("session-c"),
+			base + chrono::Duration::seconds(20),
+			None,
+		);
+		c1.agentgateway_user = Some("alice".to_string());
+		let mut c2 = sample(
+			"0005",
+			Some("session-c"),
+			base + chrono::Duration::seconds(30),
+			None,
+		);
+		c2.agentgateway_user = Some("zoe".to_string());
+		let unattributed = sample(
+			"0006",
+			Some("session-d"),
+			base + chrono::Duration::seconds(40),
+			None,
+		);
+		store
+			.insert_batch(&[a1, a2, b, c1, c2, unattributed])
+			.await
+			.unwrap();
+
+		let response = store
+			.search_sessions(SessionsRequest {
+				limit: Some(10),
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		let by_session = |name: &str| {
+			response
+				.sessions
+				.iter()
+				.find(|summary| summary.session == name)
+				.unwrap_or_else(|| panic!("{name} missing"))
+		};
+		assert_eq!(by_session("session-a").user.as_deref(), Some("alice"));
+		assert_eq!(by_session("session-b").user.as_deref(), Some("bob"));
+		assert_eq!(by_session("session-c").user.as_deref(), Some("zoe"));
+		assert_eq!(by_session("session-d").user, None);
+
+		let filtered = store
+			.search_sessions(SessionsRequest {
+				limit: Some(10),
+				filters: LogFilters {
+					attributes: std::collections::BTreeMap::from([(
+						"agentgateway.user".to_string(),
+						serde_json::json!("bob"),
+					)]),
+					..Default::default()
+				},
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		assert_eq!(filtered.sessions.len(), 1);
+		assert_eq!(filtered.sessions[0].session, "session-b");
+		assert_eq!(filtered.sessions[0].user.as_deref(), Some("bob"));
 	}
 
 	#[tokio::test]
