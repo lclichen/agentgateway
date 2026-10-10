@@ -408,3 +408,21 @@ async fn test_apikey_permissive_valid_key_inserts_claims_and_removes_header() {
 	);
 	assert!(req.extensions().get::<Claims>().is_some());
 }
+
+#[test]
+fn test_apikey_rejects_key_and_key_hash_together() {
+	// A key declared with both `key` and `keyHash` must not deserialize: the untagged
+	// LocalAPIKey variants carry deny_unknown_fields, so a payload sneaking a plaintext
+	// key alongside a hash (the platform path only ever sends keyHash) is rejected
+	// instead of persisting recoverable key material.
+	let err = serde_json::from_value::<LocalAPIKey>(serde_json::json!({
+		"key": "super-secret-plaintext",
+		"keyHash": "sha256:4c806362b613f7496abf284146efd31da90e4b16169fe001841ca17290f427c9",
+		"metadata": {"name": "platform-key"}
+	}))
+	.expect_err("key + keyHash together must be rejected");
+	assert!(
+		err.to_string().contains("data did not match any variant"),
+		"unexpected error: {err}"
+	);
+}
