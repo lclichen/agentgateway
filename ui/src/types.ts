@@ -218,6 +218,7 @@ export interface SessionSummary {
 	totalTokens: number;
 	cost: number;
 	errors: number;
+	user?: string | null;
 	title?: string | null;
 	lastLogId?: string | null;
 }
