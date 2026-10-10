@@ -3,8 +3,10 @@ import { ArrowLeft, ChevronRight, MessagesSquare, RefreshCw } from 'lucide-react
 import { useEffect, useRef, useState } from 'react';
 
 import { getLog, searchLogs, searchSessions } from '@/api/logsApi';
+import { DateRangePicker, type LogTimeRange, logTimeRangeToApi } from '@/components/DateRangePicker';
 import {
 	EmptyState,
+	FieldGroup,
 	formatDate,
 	formatNumber,
 	formatRelativeTime,
@@ -33,6 +35,8 @@ export function SessionsPage() {
 	const [loadingMore, setLoadingMore] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const [sessionId, setSessionId] = useState<string | null>(() => queryParam('session'));
+	const [userFilter, setUserFilter] = useState('');
+	const [timeRange, setTimeRange] = useState<LogTimeRange>({ mode: 'all' });
 	const loadSeqRef = useRef(0);
 
 	useEffect(() => {
@@ -51,7 +55,13 @@ export function SessionsPage() {
 		else setLoading(true);
 		setError(null);
 		try {
-			const response = await searchSessions({ limit: SESSION_PAGE_SIZE, cursor });
+			const user = userFilter.trim();
+			const response = await searchSessions({
+				limit: SESSION_PAGE_SIZE,
+				cursor,
+				timeRange: logTimeRangeToApi(timeRange),
+				filters: user ? { attributes: { 'agentgateway.user': user } } : undefined
+			});
 			if (loadSeq !== loadSeqRef.current) return;
 			setSessions(current => (cursor ? [...current, ...response.sessions] : response.sessions));
 			setNextCursor(response.nextCursor ?? null);
@@ -66,9 +76,11 @@ export function SessionsPage() {
 		}
 	}
 
+	// biome-ignore lint/correctness/useExhaustiveDependencies: load reads the latest filter state by closure; only these deps should trigger a reload.
 	useEffect(() => {
-		void load();
-	}, []);
+		const timer = setTimeout(() => void load(), userFilter ? 300 : 0);
+		return () => clearTimeout(timer);
+	}, [userFilter, timeRange]);
 
 	function openSession(id: string | null) {
 		setSessionId(id);
@@ -88,6 +100,7 @@ export function SessionsPage() {
 	const selected = sessionId
 		? (sessions.find(session => session.session === sessionId) ?? null)
 		: null;
+	const hasActiveFilters = Boolean(userFilter.trim()) || timeRange.mode !== 'all';
 
 	return (
 		<div className="page-stack">
@@ -110,10 +123,25 @@ export function SessionsPage() {
 				<SessionDetail session={sessionId} summary={selected} onBack={() => openSession(null)} />
 			) : (
 				<Panel className="logs-results-panel">
+					<div className="logs-filter-bar">
+						<FieldGroup label="User">
+							<input
+								type="text"
+								value={userFilter}
+								placeholder="Attributed user id"
+								onChange={event => setUserFilter(event.target.value)}
+							/>
+						</FieldGroup>
+						<DateRangePicker value={timeRange} onChange={setTimeRange} allowAllTime />
+					</div>
 					{sessions.length === 0 && !loading ? (
 						<EmptyState
-							title="No sessions yet"
-							description="Sessions group requests that share a session id header (x-session-id). Ensure request logging is enabled and clients send session ids."
+							title={hasActiveFilters ? 'No matching sessions' : 'No sessions yet'}
+							description={
+								hasActiveFilters
+									? 'No sessions match the current user and time filters.'
+									: 'Sessions group requests that share a session id header (x-session-id). Ensure request logging is enabled and clients send session ids.'
+							}
 						/>
 					) : sessions.length === 0 ? (
 						<StatusBanner state="loading" title="Loading sessions" />
@@ -124,6 +152,7 @@ export function SessionsPage() {
 									<tr>
 										<th>Title</th>
 										<th>Session</th>
+										<th>User</th>
 										<th className="num">Calls</th>
 										<th className="num">Errors</th>
 										<th className="num">Tokens</th>
@@ -148,7 +177,7 @@ export function SessionsPage() {
 									<button
 										className="button"
 										type="button"
-										disabled={loadingMore}
+										disabled={loadingMore || loading}
 										onClick={() => void load(nextCursor)}
 									>
 										{loadingMore ? 'Loading...' : 'Load more'}
@@ -182,6 +211,9 @@ function SessionRow(props: { session: SessionSummary; onOpen: () => void }) {
 			<td className="session-title">{title}</td>
 			<td>
 				<code className="session-id">{session.session}</code>
+			</td>
+			<td className="session-user" title={session.user ?? undefined}>
+				{session.user ?? '—'}
 			</td>
 			<td className="num">{formatNumber(session.requests)}</td>
 			<td className="num">{session.errors ? formatNumber(session.errors) : '—'}</td>

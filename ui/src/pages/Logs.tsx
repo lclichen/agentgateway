@@ -641,7 +641,7 @@ function writeAnalyticsUrlState(state: AnalyticsUrlState) {
 	const params = new URLSearchParams();
 	if (state.timeRange.mode === 'preset') {
 		if (state.timeRange.preset !== '24h') params.set('range', state.timeRange.preset);
-	} else {
+	} else if (state.timeRange.mode === 'absolute') {
 		const from = new Date(state.timeRange.fromLocal);
 		const to = new Date(state.timeRange.toLocal);
 		if (Number.isFinite(from.getTime()) && Number.isFinite(to.getTime())) {

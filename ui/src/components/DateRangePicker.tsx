@@ -7,7 +7,8 @@ import type { TimeRange } from '@/types';
 export type PresetRange = '1h' | '12h' | '24h' | '7d' | '14d' | '30d';
 export type LogTimeRange =
 	| { mode: 'preset'; preset: PresetRange }
-	| { mode: 'absolute'; fromLocal: string; toLocal: string };
+	| { mode: 'absolute'; fromLocal: string; toLocal: string }
+	| { mode: 'all' };
 
 export const RANGE_PRESETS: Array<{
 	value: PresetRange;
@@ -25,6 +26,7 @@ export const RANGE_PRESETS: Array<{
 export function DateRangePicker(props: {
 	value: LogTimeRange;
 	onChange: (value: LogTimeRange) => void;
+	allowAllTime?: boolean;
 }) {
 	const [open, setOpen] = useState(false);
 	const [draft, setDraft] = useState<LogTimeRange>(props.value);
@@ -34,7 +36,10 @@ export function DateRangePicker(props: {
 		if (open) setDraft(props.value);
 	}, [open, props.value]);
 
-	const absoluteDraft = draft.mode === 'absolute' ? draft : presetAbsoluteRange(draft.preset);
+	const absoluteDraft =
+		draft.mode === 'absolute'
+			? draft
+			: presetAbsoluteRange(draft.mode === 'preset' ? draft.preset : defaultPreset().value);
 	return (
 		<div className="date-range-picker" ref={ref}>
 			<button
@@ -50,6 +55,15 @@ export function DateRangePicker(props: {
 			{open ? (
 				<div className="date-range-popover">
 					<div className="date-range-presets">
+						{props.allowAllTime ? (
+							<button
+								className={draft.mode === 'all' ? 'active' : ''}
+								type="button"
+								onClick={() => setDraft({ mode: 'all' })}
+							>
+								All time
+							</button>
+						) : null}
 						{RANGE_PRESETS.map(preset => (
 							<button
 								className={draft.mode === 'preset' && draft.preset === preset.value ? 'active' : ''}
@@ -124,6 +138,7 @@ export function isPresetRange(value: string): value is PresetRange {
 }
 
 export function logTimeRangeToApi(value: LogTimeRange): TimeRange {
+	if (value.mode === 'all') return {};
 	if (value.mode === 'absolute') {
 		const from = dateFromLocal(value.fromLocal);
 		const to = dateFromLocal(value.toLocal);
@@ -142,6 +157,7 @@ export function logTimeRangeToApi(value: LogTimeRange): TimeRange {
 }
 
 export function logTimeRangeLabel(value: LogTimeRange) {
+	if (value.mode === 'all') return 'All time';
 	if (value.mode === 'preset') {
 		return RANGE_PRESETS.find(item => item.value === value.preset)?.label ?? 'Last 24 hours';
 	}
@@ -160,6 +176,7 @@ export function bucketSecondsForRange(value: LogTimeRange) {
 		if (value.preset === '24h' || value.preset === '7d') return 60 * 60;
 		return 24 * 60 * 60;
 	}
+	if (value.mode === 'all') return 60 * 60;
 	const rangeMs = rangeMsForLogTimeRange(value);
 	if (rangeMs <= 60 * 60 * 1000) return 60;
 	if (rangeMs <= 12 * 60 * 60 * 1000) return 10 * 60;
@@ -187,6 +204,7 @@ export function formatBucketDuration(seconds: number) {
 }
 
 function isValidLogTimeRange(value: LogTimeRange) {
+	if (value.mode === 'all') return true;
 	if (value.mode === 'preset') return true;
 	const from = dateFromLocal(value.fromLocal)?.getTime();
 	const to = dateFromLocal(value.toLocal)?.getTime();
@@ -213,6 +231,7 @@ function defaultPreset() {
 }
 
 function rangeMsForLogTimeRange(value: LogTimeRange) {
+	if (value.mode === 'all') return 24 * 60 * 60 * 1000;
 	if (value.mode === 'absolute') {
 		const from = dateFromLocal(value.fromLocal)?.getTime();
 		const to = dateFromLocal(value.toLocal)?.getTime();
