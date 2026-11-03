@@ -1405,6 +1405,104 @@ mod tests {
 		);
 	}
 
+	#[tokio::test]
+	async fn record_payload_over_cap_degrades_to_metadata_only() {
+		let backend = Backend::connect(
+			&Config {
+				url: "sqlite::memory:".to_string(),
+				max_connections: Some(1),
+				retention: None,
+				max_payload_bytes: Some(8),
+			},
+			None,
+		)
+		.await
+		.unwrap();
+		let context = || {
+			let request = crate::llm::LLMRequest {
+				input_tokens: None,
+				input_format: crate::llm::InputFormat::Responses,
+				cache_convention: Default::default(),
+				request_model: "test-model".into(),
+				provider: "test-provider".into(),
+				streaming: false,
+				params: Default::default(),
+				prompt: Some(Arc::new(vec![crate::llm::SimpleChatCompletionMessage {
+					role: "user".into(),
+					content: "a prompt far over the cap".into(),
+				}])),
+				provider_state: None,
+			};
+			let mut context = crate::cel::LLMContext::from(request);
+			context.completion = Some(vec!["a completion also over the cap".to_string()]);
+			context
+		};
+		let record = || StoredRequestLog {
+			id: "capped".to_string(),
+			started_at: Utc::now(),
+			completed_at: Utc::now(),
+			duration_ms: 1,
+			trace_id: None,
+			span_id: None,
+			http_status: Some(200),
+			error: None,
+			gen_ai_operation_name: None,
+			gen_ai_provider_name: None,
+			gen_ai_request_model: None,
+			gen_ai_response_model: None,
+			input_tokens: None,
+			output_tokens: None,
+			total_tokens: None,
+			cache_read_input_tokens: None,
+			cache_creation_input_tokens: None,
+			reasoning_tokens: None,
+			time_to_first_token_ms: None,
+			time_per_output_token_ms: None,
+			cost: None,
+			agentgateway_user: None,
+			agentgateway_group: None,
+			agentgateway_session: None,
+			user_agent_name: None,
+			has_payload: false,
+			attributes_json: "{}".into(),
+			payload: None,
+		};
+		let mut batch = Vec::new();
+		// Cap set: both halves exceed it, so the record keeps metadata only.
+		process_log_store_msg(
+			&backend,
+			&mut batch,
+			Some(8),
+			LogStoreMsg::Record(PendingRequestLog {
+				record: record(),
+				llm_mode: Some(crate::types::frontend::DatabaseLlmMode::Full),
+				input_messages: None,
+				llm_response: Some(context()),
+			}),
+		)
+		.await;
+		assert_eq!(batch.len(), 1);
+		assert!(batch[0].payload.is_none(), "oversized payload must be dropped");
+		assert!(!batch[0].has_payload);
+
+		// No cap: the same record keeps its payload.
+		process_log_store_msg(
+			&backend,
+			&mut batch,
+			None,
+			LogStoreMsg::Record(PendingRequestLog {
+				record: record(),
+				llm_mode: Some(crate::types::frontend::DatabaseLlmMode::Full),
+				input_messages: None,
+				llm_response: Some(context()),
+			}),
+		)
+		.await;
+		assert_eq!(batch.len(), 2);
+		assert!(batch[1].payload.is_some(), "uncapped payload must be kept");
+		assert!(batch[1].has_payload);
+	}
+
 	#[test]
 	fn retention_config_rejects_invalid_durations() {
 		let config = serde_json::from_value::<Config>(serde_json::json!({

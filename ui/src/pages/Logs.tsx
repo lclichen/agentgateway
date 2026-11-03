@@ -88,6 +88,14 @@ import type {
 	TimeRange
 } from '@/types';
 
+/// Today in the browser's timezone as YYYY-MM-DD, so the purge picker's max
+/// matches the local-midnight semantics of the cutoff it feeds.
+function localDateString(date: Date): string {
+	return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(
+		date.getDate()
+	).padStart(2, '0')}`;
+}
+
 export function LogsPage() {
 	const navigate = useNavigate({ from: '/llm/logs' });
 	const {
@@ -130,7 +138,7 @@ export function LogsPage() {
 	// Manual log cleanup: cutoff date plus in-flight/result state for the panel.
 	const [purgeOpen, setPurgeOpen] = useState(false);
 	const [purgeDate, setPurgeDate] = useState(() =>
-		new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+		localDateString(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000))
 	);
 	const [purging, setPurging] = useState(false);
 	const [purgeMessage, setPurgeMessage] = useState<string | null>(null);
@@ -395,7 +403,7 @@ export function LogsPage() {
 							<input
 								type="date"
 								value={purgeDate}
-								max={new Date().toISOString().slice(0, 10)}
+								max={localDateString(new Date())}
 								onChange={event => setPurgeDate(event.target.value)}
 							/>
 						</FieldGroup>

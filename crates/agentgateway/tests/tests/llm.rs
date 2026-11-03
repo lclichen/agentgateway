@@ -542,6 +542,8 @@ async fn llm_attached_rejection_is_stored_in_log_database() {
 		agentgateway::telemetry::log_store::setup(&agentgateway::telemetry::log_store::Config {
 			url: "sqlite::memory:".to_string(),
 			max_connections: Some(1),
+			retention: None,
+			max_payload_bytes: None,
 		})
 		.await
 		.unwrap();

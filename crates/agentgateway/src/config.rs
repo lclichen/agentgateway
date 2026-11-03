@@ -423,6 +423,17 @@ pub fn parse_config(
 		anyhow::bail!("config.logging.database.maxConnections must be greater than zero");
 	}
 	let logging_database = explicit_logging_database.or_else(|| database.clone());
+	if let Some(retention) = logging_database.as_ref().and_then(|database| database.retention.as_ref())
+	{
+		if retention.max_age.is_zero() {
+			anyhow::bail!("config.logging.database.retention.maxAge must be greater than zero");
+		}
+		if retention.interval.is_some_and(|interval| interval.is_zero()) {
+			// tokio's interval panics on a zero period; fail config load instead
+			// so a typo cannot silently disable the retention sweep.
+			anyhow::bail!("config.logging.database.retention.interval must be greater than zero");
+		}
+	}
 
 	let mut storage_mode = raw.storage.clone().unwrap_or_default().mode;
 	if parse::<bool>("UI_READ_ONLY")?.unwrap_or(false) {
@@ -1215,6 +1226,33 @@ mod tests {
 					env::remove_var(&self.key);
 				},
 			}
+		}
+	}
+
+	#[test]
+	fn retention_config_rejects_zero_durations() {
+		let _env_lock = lock_env();
+		for (field, value) in [("maxAge", "0s"), ("interval", "0s")] {
+			let err = parse_config(
+				format!(
+					r#"
+config:
+  logging:
+    database:
+      url: sqlite://logs.db
+      retention:
+        maxAge: 24h
+        interval: 1h
+        {field}: {value}
+"#
+				),
+				None,
+			)
+			.expect_err("zero retention durations must be rejected");
+			assert!(
+				err.to_string().contains(field),
+				"{field}: {err}"
+			);
 		}
 	}
 
