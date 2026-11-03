@@ -1,11 +1,12 @@
-import { Plus, RefreshCw, Trash2 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { Plus, RefreshCw, Trash2, Upload } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { ConfigSaveButton } from '@/components/ConfigDiffDrawer';
 import { EmptyState, formatNumber, PageHeader, Panel, StatusBanner } from '@/components/Primitives';
 import {
 	type CostCatalogSource,
 	configuredCostSources,
+	importBaseCostsAndConfigure,
 	refreshBaseCostsAndConfigure
 } from '@/costs';
 import {
@@ -41,6 +42,8 @@ export function CostsPage() {
 	const updateConfig = useUpdateConfig();
 	const upsertResource = useUpsertConfigResource();
 	const [refreshing, setRefreshing] = useState(false);
+	const [importing, setImporting] = useState(false);
+	const importFileInput = useRef<HTMLInputElement | null>(null);
 	const [message, setMessage] = useState<string | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const catalogResource = useMemo(
@@ -107,21 +110,66 @@ export function CostsPage() {
 		}
 	}
 
+	async function importCosts(file: File) {
+		// Same direct-write path as refresh: consume any recorded file override.
+		if (hybrid && baseFile) takeHybridFileWriteOverride();
+		setImporting(true);
+		setError(null);
+		setMessage(null);
+		try {
+			const catalog = JSON.parse(await file.text());
+			const imported = await importBaseCostsAndConfigure(updateConfig, catalog);
+			if (hybrid) await configResources.refetch();
+			setMessage(
+				`Base cost catalog imported: ${formatNumber(imported.models)} models from ${formatNumber(imported.providers)} providers.`
+			);
+		} catch (err) {
+			setError(
+				err instanceof Error ? err.message : `Failed to import base cost catalog from ${file.name}`
+			);
+		} finally {
+			setImporting(false);
+		}
+	}
+
 	return (
 		<div className="page-stack">
 			<PageHeader
 				title="LLM Costs"
 				description="Manage model cost catalogs used for analytics and request cost attribution."
 				actions={
-					<ConfigSaveButton
-						disabled={refreshing || saving}
-						allowHybridWrite={!baseFile}
-						hybridFileWriteMessage={`Base costs are stored in ${baseFile}. File writes are disabled in hybrid mode.`}
-						onClick={() => void refreshCosts()}
-					>
-						<RefreshCw size={16} />
-						Refresh base costs
-					</ConfigSaveButton>
+					<div className="button-row">
+						<input
+							ref={importFileInput}
+							type="file"
+							accept="application/json,.json"
+							hidden
+							onChange={event => {
+								const file = event.target.files?.[0];
+								// Allow re-picking the same file after a failure.
+								event.target.value = '';
+								if (file) void importCosts(file);
+							}}
+						/>
+						<ConfigSaveButton
+							disabled={refreshing || importing || saving}
+							allowHybridWrite={!baseFile}
+							hybridFileWriteMessage={`Base costs are stored in ${baseFile}. File writes are disabled in hybrid mode.`}
+							onClick={() => importFileInput.current?.click()}
+						>
+							<Upload size={16} />
+							{importing ? 'Importing…' : 'Import from file'}
+						</ConfigSaveButton>
+						<ConfigSaveButton
+							disabled={refreshing || importing || saving}
+							allowHybridWrite={!baseFile}
+							hybridFileWriteMessage={`Base costs are stored in ${baseFile}. File writes are disabled in hybrid mode.`}
+							onClick={() => void refreshCosts()}
+						>
+							<RefreshCw size={16} />
+							Refresh base costs
+						</ConfigSaveButton>
+					</div>
 				}
 			/>
 			{configDataLoading ? (
@@ -143,7 +191,9 @@ export function CostsPage() {
 						<h3>Catalog sources</h3>
 						<p>
 							Sources are merged in order. Database sources load first, and later file sources
-							override them.
+							override them. Offline deployments: generate a catalog on a connected machine
+							with <code>agctl catalog import --out base-costs.json</code> and import the file
+							here.
 						</p>
 					</div>
 				</div>

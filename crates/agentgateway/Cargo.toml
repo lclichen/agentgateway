@@ -170,7 +170,9 @@ uuid.workspace = true
 value-bag.workspace = true
 x509-parser.workspace = true
 zstd.workspace = true
-reqwest.workspace = true
+# "stream": bounded model-discovery response reads (provider_discovery.rs);
+# without it the method only exists when a dev-dependency happens to enable it.
+reqwest = { workspace = true, features = ["stream"] }
 websocket-sans-io.workspace = true
 vector-map.workspace = true
 flagset.workspace = true

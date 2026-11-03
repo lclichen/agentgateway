@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_core::version::BuildInfo;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::sse::Event;
 use axum::response::{IntoResponse, Redirect, Response, Sse};
@@ -118,8 +118,14 @@ pub fn router(
 		.route("/api/feedback", post(post_feedback))
 		.route("/api/feedback/export", get(export_feedback))
 		.route("/api/logs/analytics/summary", post(analytics_summary))
-		.route("/api/costs/models", get(cost_models))
-		.route("/api/costs/refresh-base", post(refresh_base_costs))
+	.route("/api/costs/models", get(cost_models))
+	.route("/api/costs/refresh-base", post(refresh_base_costs))
+	// Generated catalogs are under a megabyte today; agctl merges can grow,
+	// so allow well beyond the 2 MB JSON default without unbounded uploads.
+	.route(
+		"/api/costs/import-base",
+		post(import_base_costs).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+	)
 		.route(
 			"/api/providers/discover-models",
 			post(discover_provider_models),
@@ -1005,6 +1011,43 @@ async fn refresh_base_costs(
 	Extension(auth): Extension<AuthorizationContext>,
 ) -> Result<Json<Value>, ErrorResponse> {
 	app.ensure_writable()?;
+	let refreshed = crate::llm::catalog::refresh::fetch_base_catalog().await?;
+	store_base_catalog(&app, &auth, refreshed.catalog).await
+}
+
+/// Install an uploaded base catalog without touching the network: the offline
+/// counterpart of `refresh_base_costs` for air-gapped deployments (generate the
+/// file with `agctl catalog import --out` on a connected machine, then import).
+async fn import_base_costs(
+	State(app): State<App>,
+	Extension(auth): Extension<AuthorizationContext>,
+	Json(mut catalog): Json<crate::llm::catalog::Catalog>,
+) -> Result<Json<Value>, ErrorResponse> {
+	app.ensure_writable()?;
+	// Same leniency as the online refresh: catalogs from newer agctl versions
+	// may carry unknown fields; unknown-condition tiers are dropped.
+	catalog
+		.validate_newer()
+		.map_err(ErrorResponse::Anyhow)?;
+	// Base selection picks the catalog with the newest generatedAt, so an
+	// import explicitly stamps now — otherwise an older file would silently
+	// lose to the previously stored base. Custom overlays still apply on top.
+	catalog.metadata = Some(crate::llm::catalog::CatalogMetadata {
+		source: None,
+		generated_at: Utc::now(),
+		unknown: Default::default(),
+	});
+	store_base_catalog(&app, &auth, catalog).await
+}
+
+/// Persist a validated base catalog: into the DB `modelCatalog` resource for
+/// hybrid installs without a configured file source, otherwise to the
+/// `base-costs.json` file next to the config (hot-reloaded via the file source).
+async fn store_base_catalog(
+	app: &App,
+	auth: &AuthorizationContext,
+	catalog: crate::llm::catalog::Catalog,
+) -> Result<Json<Value>, ErrorResponse> {
 	let configured_file = app.state.model_catalog.sources.iter().find_map(|source| {
 		if let crate::ModelCatalogSource::File { file } = source {
 			Some(file)
@@ -1013,38 +1056,42 @@ async fn refresh_base_costs(
 		}
 	});
 	if configured_file.is_none() && app.state.storage.mode == ConfigStoreMode::Hybrid {
-		let refreshed = crate::llm::catalog::refresh::fetch_base_catalog().await?;
 		let store = app.config_resource_store()?;
 		// Re-read and merge on every retry so concurrent custom-cost edits are preserved.
-		with_generation_retry(None, || async {
-			let snapshot = store.snapshot(None).await.map_err(resource_api_error)?;
-			let mut value = snapshot
-				.resources
-				.iter()
-				.find(|resource| resource.kind == ConfigResourceKind::ModelCatalog)
-				.map(|resource| resource.value.clone())
-				.unwrap_or_else(|| serde_json::json!({}));
-			let object = value.as_object_mut().ok_or_else(|| {
-				resource_api_error(anyhow::anyhow!("modelCatalog resource must be an object"))
-			})?;
-			object.insert(
-				"base".to_string(),
-				serde_json::to_value(&refreshed.catalog)
-					.map_err(|err| ErrorResponse::Anyhow(err.into()))?,
-			);
-			upsert_config_resources(
-				&app,
-				&auth,
-				ConfigResourceKind::ModelCatalog,
-				ConfigResourceUpsertRequest {
-					resources: vec![crate::config_store::ConfigResourceUpsert { value }],
-				},
-				Some(snapshot.generation),
-			)
-			.await
-			.map(|_| ())
+		with_generation_retry(None, || {
+			let store = store.clone();
+			let catalog = catalog.clone();
+			async move {
+				let snapshot = store.snapshot(None).await.map_err(resource_api_error)?;
+				let mut value = snapshot
+					.resources
+					.iter()
+					.find(|resource| resource.kind == ConfigResourceKind::ModelCatalog)
+					.map(|resource| resource.value.clone())
+					.unwrap_or_else(|| serde_json::json!({}));
+				let object = value.as_object_mut().ok_or_else(|| {
+					resource_api_error(anyhow::anyhow!("modelCatalog resource must be an object"))
+				})?;
+				object.insert(
+					"base".to_string(),
+					serde_json::to_value(&catalog)
+						.map_err(|err| ErrorResponse::Anyhow(err.into()))?,
+				);
+				upsert_config_resources(
+					app,
+					auth,
+					ConfigResourceKind::ModelCatalog,
+					ConfigResourceUpsertRequest {
+						resources: vec![crate::config_store::ConfigResourceUpsert { value }],
+					},
+					Some(snapshot.generation),
+				)
+				.await
+				.map(|_| ())
+			}
 		})
 		.await?;
+		let refreshed = crate::llm::catalog::refresh::refresh_response(catalog);
 		return serde_json::to_value(refreshed)
 			.map(Json)
 			.map_err(|err| ErrorResponse::Anyhow(err.into()));
@@ -1057,7 +1104,7 @@ async fn refresh_base_costs(
 			ConfigSource::File(path) => path,
 			ConfigSource::Static(_) => {
 				return Err(ErrorResponse::String(
-					"Cannot refresh base costs for static config".to_string(),
+					"Cannot install base costs for static config".to_string(),
 				));
 			},
 		};
@@ -1070,17 +1117,25 @@ async fn refresh_base_costs(
 		dir.join(BASE_COSTS_FILE)
 	};
 
-	let refreshed = crate::llm::catalog::refresh::refresh_base_catalog(
+	let providers = catalog.providers.len();
+	let models: usize = catalog
+		.providers
+		.values()
+		.map(|provider| provider.models.len())
+		.sum();
+	crate::llm::catalog::refresh::write_base_catalog(
 		&base_costs_file,
 		configured_file.map(|_| app.model_catalog.as_ref()),
+		&catalog,
 	)
-	.await?;
+	.await
+	.map_err(ErrorResponse::Anyhow)?;
 
-	let mut response =
-		serde_json::to_value(refreshed).map_err(|e| ErrorResponse::Anyhow(e.into()))?;
+	let mut response = serde_json::json!({ "providers": providers, "models": models });
 	if configured_file.is_none()
 		&& let Value::Object(fields) = &mut response
 	{
+		// Tell the UI which file was written so it can register the source.
 		fields.insert(
 			"file".to_string(),
 			Value::String(base_costs_file.to_string_lossy().to_string()),
@@ -1686,6 +1741,194 @@ mod tests {
 			let value: Value = serde_json::from_slice(&body).unwrap();
 			assert!(value.get("generation").is_none(), "{method} {uri}: {value}");
 		}
+	}
+
+	/// A minimal, schema-valid catalog for the import endpoint tests.
+	const IMPORT_CATALOG: &str = r#"{
+		"providers": {
+			"acme": {
+				"models": {
+					"acme-mini": { "rates": { "input": "0.10", "output": "0.20" } },
+					"acme-pro": { "rates": { "input": "1.00", "output": "2.00" } }
+				}
+			}
+		}
+	}"#;
+
+	async fn post_json(
+		router: &axum::Router,
+		uri: &str,
+		body: &str,
+	) -> (StatusCode, Value) {
+		let response = router
+			.clone()
+			.oneshot(
+				axum::extract::Request::builder()
+					.method("POST")
+					.uri(uri)
+					.header("content-type", "application/json")
+					.body(axum::body::Body::from(body.to_string()))
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		let status = response.status();
+		let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+			.await
+			.unwrap();
+		let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+		(status, value)
+	}
+
+	#[tokio::test]
+	async fn import_base_costs_writes_file_next_to_config() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("config.yaml");
+		fs_err::write(&path, "{}").unwrap();
+		let mut app = test_app(false);
+		let state = Arc::get_mut(&mut app.state).unwrap();
+		state.xds.local_config = Some(ConfigSource::File(path));
+		let router = router(
+			app.state.clone(),
+			app.model_catalog.clone(),
+			None,
+			app.resource_manager.clone(),
+			&EMPTY_ASSETS_DIR,
+		);
+		let (status, body) = post_json(&router, "/api/costs/import-base", IMPORT_CATALOG).await;
+		assert_eq!(status, StatusCode::OK, "{body}");
+		assert_eq!(body["providers"], 1);
+		assert_eq!(body["models"], 2);
+		let written = dir.path().join(BASE_COSTS_FILE);
+		assert_eq!(
+			body["file"].as_str().unwrap(),
+			written.to_string_lossy().to_string()
+		);
+		let stored: crate::llm::catalog::Catalog =
+			serde_json::from_str(&fs_err::read_to_string(&written).unwrap()).unwrap();
+		let generated_at = stored
+			.metadata
+			.expect("import stamps metadata")
+			.generated_at;
+		assert!(
+			Utc::now()
+				.signed_duration_since(generated_at)
+				.num_minutes()
+				.abs()
+				< 5,
+			"generatedAt must be stamped at import time"
+		);
+		assert_eq!(
+			stored.providers["acme"].models["acme-mini"]
+				.rates
+				.input
+				.as_ref()
+				.unwrap()
+				.to_string(),
+			"0.10"
+		);
+	}
+
+	#[tokio::test]
+	async fn import_base_costs_hybrid_merges_into_db_base() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("config.yaml");
+		fs_err::write(&path, "{}").unwrap();
+		let mut app = test_app(false);
+		let state = Arc::get_mut(&mut app.state).unwrap();
+		state.storage.mode = ConfigStoreMode::Hybrid;
+		state.xds.local_config = Some(ConfigSource::File(path));
+		app.config_resource_store = Some(
+			crate::config_store::setup(&crate::telemetry::log_store::Config {
+				url: format!("sqlite://{}", dir.path().join("config.db").display()),
+				max_connections: None,
+			})
+			.await
+			.unwrap(),
+		);
+		let router = router(
+			app.state.clone(),
+			app.model_catalog.clone(),
+			app.config_resource_store.clone(),
+			app.resource_manager.clone(),
+			&EMPTY_ASSETS_DIR,
+		);
+		// A custom overlay written first must survive the import.
+		let response = router
+			.clone()
+			.oneshot(
+				axum::extract::Request::builder()
+					.method("PUT")
+					.uri("/api/config/resources/modelCatalog")
+					.header("content-type", "application/json")
+					.body(axum::body::Body::from(
+						r#"{"resources":[{"value":{"custom":{"providers":{"acme":{"models":{"acme-mini":{"rates":{"input":"0.01"}}}}}}}}]}"#,
+					))
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+
+		let (status, body) = post_json(&router, "/api/costs/import-base", IMPORT_CATALOG).await;
+		assert_eq!(status, StatusCode::OK, "{body}");
+		// Hybrid without a file source reports counts only; no file to register.
+		assert!(body.get("file").is_none(), "{body}");
+
+		// Fetch through the resource API to confirm base was stored and custom kept.
+		let response = router
+			.clone()
+			.oneshot(
+				axum::extract::Request::builder()
+					.method("GET")
+					.uri("/api/config/resources/modelCatalog")
+					.body(axum::body::Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		let list: Value =
+			serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap())
+				.unwrap();
+		let resource = &list["resources"][0]["value"];
+		assert!(
+			resource["base"]["providers"]["acme"]["models"]["acme-mini"].is_object(),
+			"imported catalog stored as base: {resource}"
+		);
+		assert!(
+			resource["custom"]["providers"]["acme"]["models"]["acme-mini"]["rates"]["input"]
+				== "0.01",
+			"custom overlay preserved: {resource}"
+		);
+	}
+
+	#[tokio::test]
+	async fn import_base_costs_rejects_invalid_catalogs() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("config.yaml");
+		fs_err::write(&path, "{}").unwrap();
+		let app = test_app(false);
+		let router = router(
+			app.state.clone(),
+			app.model_catalog.clone(),
+			None,
+			app.resource_manager.clone(),
+			&EMPTY_ASSETS_DIR,
+		);
+		// Rates must be decimal strings; a JSON number is a schema violation.
+		let (status, body) = post_json(
+			&router,
+			"/api/costs/import-base",
+			r#"{"providers":{"acme":{"models":{"m":{"rates":{"input":0.1}}}}}}"#,
+		)
+		.await;
+		// axum answers JSON deserialization rejections with 400/422 depending
+		// on the failure kind; either way it must not look like a success.
+		assert!(!status.is_success(), "{status} {body}");
+		assert!(
+			!dir.path().join(BASE_COSTS_FILE).exists(),
+			"an invalid catalog must not be written"
+		);
 	}
 
 	#[tokio::test]

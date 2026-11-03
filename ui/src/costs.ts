@@ -1,4 +1,4 @@
-import { refreshBaseCosts } from '@/api/costsApi';
+import { importBaseCosts, refreshBaseCosts, type RefreshBaseCostsResponse } from '@/api/costsApi';
 import type { GatewayConfig } from '@/types';
 
 export type CostCatalogSource = { file?: string; inline?: unknown };
@@ -19,13 +19,30 @@ export function addBaseCostSource(config: GatewayConfig, file: string) {
 	return config;
 }
 
-export async function refreshBaseCostsAndConfigure(updateConfig: {
+type UpdateConfig = {
 	mutateAsync: (updater: (config: GatewayConfig) => GatewayConfig | undefined) => Promise<unknown>;
-}) {
-	const refreshed = await refreshBaseCosts();
-	if (refreshed.file) {
-		const file = refreshed.file;
+};
+
+/// When the response names a freshly written base-costs file, register it as a
+/// catalog source so subsequent reloads pick it up.
+async function configureBaseCostSource(
+	updateConfig: UpdateConfig,
+	response: RefreshBaseCostsResponse
+) {
+	if (response.file) {
+		const file = response.file;
 		await updateConfig.mutateAsync(next => addBaseCostSource(next, file));
 	}
-	return refreshed;
+	return response;
+}
+
+export async function refreshBaseCostsAndConfigure(updateConfig: UpdateConfig) {
+	return configureBaseCostSource(updateConfig, await refreshBaseCosts());
+}
+
+export async function importBaseCostsAndConfigure(
+	updateConfig: UpdateConfig,
+	catalog: unknown
+) {
+	return configureBaseCostSource(updateConfig, await importBaseCosts(catalog));
 }

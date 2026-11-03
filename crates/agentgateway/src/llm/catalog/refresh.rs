@@ -20,8 +20,19 @@ pub async fn refresh_base_catalog(
 	file: &Path,
 	model_catalog: Option<&ModelCatalog>,
 ) -> anyhow::Result<RefreshBaseCatalogResponse> {
-	let refreshed = fetch_base_catalog().await?;
-	let json = serde_json::to_vec_pretty(&refreshed.catalog).context("marshal model catalog")?;
+	let catalog = fetch_base_catalog().await?.catalog;
+	write_base_catalog(file, model_catalog, &catalog).await?;
+	Ok(refresh_response(catalog))
+}
+
+/// Persist a base catalog to `file` and hot-reload the model catalog. Shared by
+/// the online refresh and the offline import so both land on disk identically.
+pub async fn write_base_catalog(
+	file: &Path,
+	model_catalog: Option<&ModelCatalog>,
+	catalog: &model::Catalog,
+) -> anyhow::Result<()> {
+	let json = serde_json::to_vec_pretty(catalog).context("marshal model catalog")?;
 	if let Some(parent) = file.parent() {
 		fs_err::tokio::create_dir_all(parent).await?;
 	}
@@ -29,7 +40,7 @@ pub async fn refresh_base_catalog(
 	if let Some(model_catalog) = model_catalog {
 		model_catalog.reload().await?;
 	}
-	Ok(refreshed)
+	Ok(())
 }
 
 pub async fn fetch_base_catalog() -> anyhow::Result<RefreshBaseCatalogResponse> {
@@ -47,15 +58,20 @@ pub async fn fetch_base_catalog() -> anyhow::Result<RefreshBaseCatalogResponse> 
 		.await
 		.context("decode model catalog from GitHub")?;
 	catalog.validate_newer()?;
+	Ok(refresh_response(catalog))
+}
+
+/// Count the catalog contents for a refresh/import response.
+pub fn refresh_response(catalog: model::Catalog) -> RefreshBaseCatalogResponse {
 	let providers = catalog.providers.len();
 	let models = catalog
 		.providers
 		.values()
 		.map(|provider| provider.models.len())
 		.sum();
-	Ok(RefreshBaseCatalogResponse {
+	RefreshBaseCatalogResponse {
 		providers,
 		models,
 		catalog,
-	})
+	}
 }

@@ -20,6 +20,15 @@ export function refreshBaseCosts() {
 	});
 }
 
+/// Installs an uploaded base catalog for air-gapped deployments; the body is
+/// the catalog JSON itself (generate with `agctl catalog import --out`).
+export function importBaseCosts(catalog: unknown) {
+	return requestJson<RefreshBaseCostsResponse>('/api/costs/import-base', {
+		method: 'POST',
+		body: JSON.stringify(catalog)
+	});
+}
+
 export function listCostModels() {
 	return requestJson<CostCatalogModelsResponse>('/api/costs/models');
 }
