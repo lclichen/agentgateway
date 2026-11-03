@@ -20,6 +20,8 @@ pub struct SqliteLogStore {
 }
 
 const ANALYTICS_FILTER_OPTION_LIMIT: i64 = 500;
+/// Rows removed per purge transaction; keeps each write lock short.
+const PURGE_BATCH_SIZE: i64 = 500;
 // Leave room below SQLite's 32,766-parameter limit for two more log fields or one payload field.
 const LOG_INSERT_CHUNK_SIZE: usize = 1_150;
 const PAYLOAD_INSERT_CHUNK_SIZE: usize = 8_000;
@@ -551,6 +553,49 @@ impl SqliteLogStore {
 			})
 			.collect()
 	}
+
+	/// Delete logs completed before the cutoff in bounded batches so the write
+	/// lock is never held across the whole table, then reclaim the file space:
+	/// freed pages stay inside the file until VACUUM, and the WAL keeps growing
+	/// until checkpointed.
+	pub async fn purge(&self, request: super::PurgeRequest) -> anyhow::Result<super::PurgeResponse> {
+		let mut deleted_logs = 0u64;
+		loop {
+			let mut tx = self.pool.begin().await?;
+			// Payloads first, by the same deterministic batch the log delete takes;
+			// no explicit FK dependency so this works regardless of pragma state.
+			sqlx::query(
+				"DELETE FROM request_log_payloads WHERE log_id IN (\
+				 SELECT id FROM request_logs WHERE completed_at < ? ORDER BY id LIMIT ?)",
+			)
+			.bind(request.before)
+			.bind(PURGE_BATCH_SIZE)
+			.execute(&mut *tx)
+			.await?;
+			let removed = sqlx::query(
+				"DELETE FROM request_logs WHERE id IN (\
+				 SELECT id FROM request_logs WHERE completed_at < ? ORDER BY id LIMIT ?)",
+			)
+			.bind(request.before)
+			.bind(PURGE_BATCH_SIZE)
+			.execute(&mut *tx)
+			.await?
+			.rows_affected();
+			tx.commit().await?;
+			if removed == 0 {
+				break;
+			}
+			deleted_logs += removed;
+		}
+		if deleted_logs > 0 {
+			for statement in ["PRAGMA wal_checkpoint(TRUNCATE)", "VACUUM"] {
+				if let Err(err) = sqlx::query(statement).execute(&self.pool).await {
+					tracing::warn!(target: "request", statement, ?err, "post-purge maintenance failed");
+				}
+			}
+		}
+		Ok(super::PurgeResponse { deleted_logs })
+	}
 }
 
 fn analytics_filter_option_map() -> std::collections::BTreeMap<String, Vec<String>> {
@@ -858,6 +903,7 @@ mod tests {
 	use sqlx::sqlite::SqlitePoolOptions;
 
 	use super::*;
+	use crate::telemetry::log_store::PurgeRequest;
 
 	#[tokio::test]
 	async fn analytics_totals_from_migrated_and_new_rows() -> anyhow::Result<()> {
@@ -1038,6 +1084,82 @@ INSERT INTO request_logs VALUES (
 
 		let none = search(Some("ffff")).await.unwrap();
 		assert_eq!(none.logs.len(), 0);
+	}
+
+	#[tokio::test]
+	async fn purge_deletes_logs_and_payloads_before_cutoff_only() {
+		let store = SqliteLogStore::from_pool(memory_pool().await)
+			.await
+			.unwrap();
+		let old = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+		let recent = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+		store
+			.insert_batch(&[
+				sample("old-payload", None, old, Some(prompt_payload("old prompt"))),
+				sample("old-plain", None, old, None),
+				sample("new-payload", None, recent, Some(prompt_payload("new prompt"))),
+			])
+			.await
+			.unwrap();
+
+		let before = Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap();
+		let response = store
+			.purge(PurgeRequest { before })
+			.await
+			.unwrap();
+		assert_eq!(response.deleted_logs, 2, "both old rows go, payload or not");
+
+		let remaining = store
+			.search(SearchRequest {
+				limit: Some(10),
+				cursor: None,
+				time_range: None,
+				filters: LogFilters::default(),
+				include_attributes: false,
+				include_payload: true,
+			})
+			.await
+			.unwrap();
+		assert_eq!(remaining.logs.len(), 1);
+		assert_eq!(remaining.logs[0].id, "new-payload");
+
+		// The deleted row (and its payload) are gone entirely.
+		let gone = store
+			.get(GetRequest {
+				id: "old-payload".to_string(),
+				include_payload: true,
+			})
+			.await
+			.unwrap();
+		assert!(gone.log.is_none());
+
+		// A second sweep has nothing to remove.
+		let again = store
+			.purge(PurgeRequest { before })
+			.await
+			.unwrap();
+		assert_eq!(again.deleted_logs, 0);
+	}
+
+	#[tokio::test]
+	async fn purge_removes_more_than_one_batch() {
+		let store = SqliteLogStore::from_pool(memory_pool().await)
+			.await
+			.unwrap();
+		let old = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+		// Well past the 500-row batch size to prove the loop drains fully.
+		let records = (0..1200)
+			.map(|index| sample(&format!("old-{index:04}"), None, old, None))
+			.collect::<Vec<_>>();
+		store.insert_batch(&records).await.unwrap();
+
+		let response = store
+			.purge(PurgeRequest {
+				before: old + chrono::Duration::seconds(1),
+			})
+			.await
+			.unwrap();
+		assert_eq!(response.deleted_logs, 1200);
 	}
 
 	#[tokio::test]

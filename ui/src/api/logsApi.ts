@@ -38,6 +38,15 @@ export function searchSessions(request: SessionsRequest) {
 	});
 }
 
+/// Delete request logs completed before the instant. Payloads go with their
+/// logs; returns how many log rows were removed.
+export function purgeLogs(before: string) {
+	return requestJson<{ deletedLogs: number }>('/api/logs/purge', {
+		method: 'POST',
+		body: JSON.stringify({ before })
+	});
+}
+
 export async function* streamLogs(
 	request: SearchLogsRequest,
 	signal: AbortSignal

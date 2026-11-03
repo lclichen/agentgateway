@@ -115,6 +115,7 @@ pub fn router(
 		.route("/api/logs/tail", post(tail_logs))
 		.route("/api/logs/sessions", post(search_sessions))
 		.route("/api/logs/export", post(export_logs))
+		.route("/api/logs/purge", post(purge_logs))
 		.route("/api/feedback", post(post_feedback))
 		.route("/api/feedback/export", get(export_feedback))
 		.route("/api/logs/analytics/summary", post(analytics_summary))
@@ -1467,6 +1468,20 @@ async fn export_logs(Json(request): Json<LogsExportRequest>) -> Result<Response,
 		.map_err(|err| ErrorResponse::Anyhow(anyhow::anyhow!(err)))
 }
 
+/// Delete request logs completed before the given instant. Destructive, so it
+/// is gated like a config write rather than a read-only log query; the
+/// configured retention sweep uses the same store operation unattended.
+async fn purge_logs(
+	State(app): State<App>,
+	Json(request): Json<crate::telemetry::log_store::PurgeRequest>,
+) -> Result<Json<crate::telemetry::log_store::PurgeResponse>, ErrorResponse> {
+	app.ensure_writable()?;
+	crate::telemetry::log_store::purge(request)
+		.await
+		.map(Json)
+		.map_err(ErrorResponse::Anyhow)
+}
+
 #[derive(serde::Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LogsExportRequest {
@@ -1695,6 +1710,8 @@ mod tests {
 			crate::config_store::setup(&crate::telemetry::log_store::Config {
 				url: format!("sqlite://{}", dir.path().join("config.db").display()),
 				max_connections: None,
+				retention: None,
+				max_payload_bytes: None,
 			})
 			.await
 			.unwrap(),
@@ -1842,6 +1859,8 @@ mod tests {
 			crate::config_store::setup(&crate::telemetry::log_store::Config {
 				url: format!("sqlite://{}", dir.path().join("config.db").display()),
 				max_connections: None,
+				retention: None,
+				max_payload_bytes: None,
 			})
 			.await
 			.unwrap(),
@@ -1961,6 +1980,8 @@ mod tests {
 		let store = crate::config_store::setup(&crate::telemetry::log_store::Config {
 			url: format!("sqlite://{}", dir.path().join("config.db").display()),
 			max_connections: None,
+			retention: None,
+			max_payload_bytes: None,
 		})
 		.await
 		.unwrap();
@@ -2284,5 +2305,25 @@ mod tests {
 	async fn ensure_writable_allows_when_not_read_only() {
 		let app = test_app(false);
 		assert!(app.ensure_writable().is_ok());
+	}
+
+	#[tokio::test]
+	async fn log_purge_is_blocked_when_read_only() {
+		let app = test_app(true);
+		let router = router(
+			app.state.clone(),
+			app.model_catalog.clone(),
+			None,
+			app.resource_manager.clone(),
+			&EMPTY_ASSETS_DIR,
+		);
+		// The read-only rejection must fire before any store is consulted.
+		let (status, _) = post_json(
+			&router,
+			"/api/logs/purge",
+			r#"{"before":"2026-01-01T00:00:00Z"}"#,
+		)
+		.await;
+		assert_eq!(status, StatusCode::FORBIDDEN);
 	}
 }

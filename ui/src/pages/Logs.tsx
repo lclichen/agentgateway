@@ -15,13 +15,14 @@ import {
 	Shield,
 	ShieldBan,
 	ShieldEllipsis,
+	Trash2,
 	User,
 	Wrench
 } from 'lucide-react';
 import { marked } from 'marked';
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
-import { analyticsSummary, getLog, searchLogs, streamLogs } from '@/api/logsApi';
+import { analyticsSummary, getLog, purgeLogs, searchLogs, streamLogs } from '@/api/logsApi';
 import { ConfigDiffSaveActions } from '@/components/ConfigDiffDrawer';
 import {
 	bucketCountForRange,
@@ -126,6 +127,14 @@ export function LogsPage() {
 	const [expandedLoading, setExpandedLoading] = useState(false);
 	const [loading, setLoading] = useState(false);
 	const [error, setError] = useState<string | null>(null);
+	// Manual log cleanup: cutoff date plus in-flight/result state for the panel.
+	const [purgeOpen, setPurgeOpen] = useState(false);
+	const [purgeDate, setPurgeDate] = useState(() =>
+		new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+	);
+	const [purging, setPurging] = useState(false);
+	const [purgeMessage, setPurgeMessage] = useState<string | null>(null);
+	const [purgeError, setPurgeError] = useState<string | null>(null);
 	const abortRef = useRef<AbortController | null>(null);
 	const loadSeqRef = useRef(0);
 	const detailSeqRef = useRef(0);
@@ -313,6 +322,33 @@ export function LogsPage() {
 		await loadExpandedLog(entry.id, entry);
 	}
 
+	async function confirmPurge() {
+		if (!purgeDate) return;
+		setPurging(true);
+		setPurgeError(null);
+		setPurgeMessage(null);
+		try {
+			// Local midnight of the picked day; everything completed strictly
+			// before it is removed together with its payloads.
+			const cutoff = new Date(`${purgeDate}T00:00:00`);
+			if (Number.isNaN(cutoff.getTime())) {
+				throw new Error('Pick a valid date');
+			}
+			const result = await purgeLogs(cutoff.toISOString());
+			setPurgeMessage(
+				result.deletedLogs > 0
+					? `Deleted ${formatNumber(result.deletedLogs)} logs completed before ${formatDate(cutoff.toISOString())}.`
+					: 'No logs matched the selected date.'
+			);
+			setPurgeOpen(false);
+			void load();
+		} catch (err) {
+			setPurgeError(err instanceof Error ? err.message : 'Failed to purge logs');
+		} finally {
+			setPurging(false);
+		}
+	}
+
 	return (
 		<div className="page-stack">
 			<PageHeader
@@ -324,6 +360,17 @@ export function LogsPage() {
 							<Settings size={16} />
 							Settings
 						</button>
+						<button
+							className="button"
+							type="button"
+							onClick={() => {
+								setPurgeOpen(open => !open);
+								setPurgeError(null);
+							}}
+						>
+							<Trash2 size={16} />
+							Clean up
+						</button>
 						<button className="button" type="button" disabled={loading} onClick={load}>
 							<RefreshCw size={16} className={loading ? 'spin' : undefined} />
 							Refresh
@@ -331,6 +378,52 @@ export function LogsPage() {
 					</div>
 				}
 			/>
+			{purgeOpen ? (
+				<Panel>
+					<div className="editor-title">
+						<div>
+							<h3>Delete old logs</h3>
+							<p>
+								Request logs completed before the selected date are deleted permanently,
+								together with their stored request/response payloads. Feedback entries are
+								kept.
+							</p>
+						</div>
+					</div>
+					<div className="button-row">
+						<FieldGroup label="Delete logs completed before">
+							<input
+								type="date"
+								value={purgeDate}
+								max={new Date().toISOString().slice(0, 10)}
+								onChange={event => setPurgeDate(event.target.value)}
+							/>
+						</FieldGroup>
+						<button
+							className="button danger"
+							type="button"
+							disabled={purging || !purgeDate}
+							onClick={() => void confirmPurge()}
+						>
+							{purging ? 'Deleting…' : 'Delete logs'}
+						</button>
+						<button
+							className="button"
+							type="button"
+							disabled={purging}
+							onClick={() => setPurgeOpen(false)}
+						>
+							Cancel
+						</button>
+					</div>
+				</Panel>
+			) : null}
+			{purgeError ? (
+				<StatusBanner state="bad" title="Log cleanup failed">
+					{purgeError}
+				</StatusBanner>
+			) : null}
+			{purgeMessage ? <StatusBanner state="ok" title={purgeMessage} /> : null}
 			{configDataLoading ? (
 				<StatusBanner state="loading" title="Loading LLM configuration" />
 			) : configDataError ? (

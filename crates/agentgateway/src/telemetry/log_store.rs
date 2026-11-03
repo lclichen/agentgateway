@@ -9,7 +9,7 @@ use crossbeam::channel::{Receiver, Sender, TryRecvError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::oneshot;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{apply, schema};
 
@@ -31,6 +31,48 @@ pub struct Config {
 	#[serde(default)]
 	#[cfg_attr(feature = "schema", schemars(range(min = 1)))]
 	pub max_connections: Option<u32>,
+	/// Automatically delete request logs older than the retention window. Without it, logs (and
+	/// their payloads) accumulate forever.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub retention: Option<RetentionConfig>,
+	/// Cap on the serialized size of a stored request/response payload, in bytes. A payload whose
+	/// request or response half exceeds the cap is stored as metadata only. Unset means unlimited.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+	pub max_payload_bytes: Option<usize>,
+}
+
+#[apply(schema!)]
+#[derive(Eq, PartialEq)]
+pub struct RetentionConfig {
+	/// Request logs completed more than this long ago are deleted.
+	#[serde(with = "crate::serde_dur")]
+	#[cfg_attr(feature = "schema", schemars(with = "String"))]
+	pub max_age: std::time::Duration,
+	/// How often the retention sweep runs. Defaults to 1h; the first sweep runs at startup.
+	#[serde(default, with = "crate::serde_dur_option")]
+	#[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+	pub interval: Option<std::time::Duration>,
+}
+
+impl RetentionConfig {
+	/// The sweep cadence, defaulting to hourly when unset.
+	pub fn sweep_interval(&self) -> std::time::Duration {
+		self.interval.unwrap_or(std::time::Duration::from_secs(3600))
+	}
+}
+
+/// Deletion request for logs that completed before a cutoff instant.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PurgeRequest {
+	pub before: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurgeResponse {
+	pub deleted_logs: u64,
 }
 
 #[derive(Clone)]
@@ -78,10 +120,54 @@ pub async fn setup_with_pool(
 		.map_err(|_| anyhow::anyhow!("request log database worker stopped during startup"))??;
 	let store = RequestLogStore { tx: tx.clone() };
 	let _ = REQUEST_LOG_STORE.set(store);
+	let retention_task = cfg.retention.as_ref().map(|retention| {
+		spawn_retention_sweep(tx.clone(), retention.max_age, retention.sweep_interval())
+	});
 	Ok(RequestLogStoreGuard {
 		tx,
 		writer: Some(writer),
+		retention_task,
 	})
+}
+
+/// Periodically purge logs older than the retention window. The first sweep
+/// runs immediately so a restart catches up; later sweeps back off rather than
+/// bursting after a suspension.
+fn spawn_retention_sweep(
+	tx: Sender<LogStoreMsg>,
+	max_age: std::time::Duration,
+	interval: std::time::Duration,
+) -> tokio::task::AbortHandle {
+	let store = RequestLogStore { tx };
+	tokio::spawn(async move {
+		let mut ticker = tokio::time::interval(interval);
+		ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+		loop {
+			ticker.tick().await;
+			let before = Utc::now() - max_age;
+			match store
+				.request(|tx| LogStoreMsg::Purge {
+					request: PurgeRequest { before },
+					tx,
+				})
+				.await
+			{
+				Ok(response) if response.deleted_logs > 0 => {
+					info!(
+						target: "request",
+						deleted = response.deleted_logs,
+						?before,
+						"request log retention sweep"
+					);
+				},
+				Ok(_) => {},
+				Err(err) => {
+					warn!(target: "request", ?err, "request log retention sweep failed");
+				},
+			}
+		}
+	})
+	.abort_handle()
 }
 
 pub(super) fn emit(record: PendingRequestLog) {
@@ -155,13 +241,29 @@ pub async fn feedback_export() -> anyhow::Result<Vec<FeedbackEntry>> {
 	store.request(|tx| LogStoreMsg::FeedbackExport { tx }).await
 }
 
+/// Delete request logs that completed before `request.before`. Payload rows go
+/// with their logs; feedback entries are user-curated and are kept.
+pub async fn purge(request: PurgeRequest) -> anyhow::Result<PurgeResponse> {
+	let store = REQUEST_LOG_STORE
+		.get()
+		.ok_or_else(|| anyhow::anyhow!("request log database is not configured"))?;
+	store
+		.request(|tx| LogStoreMsg::Purge { request, tx })
+		.await
+}
+
 pub struct RequestLogStoreGuard {
 	tx: Sender<LogStoreMsg>,
 	writer: Option<thread::JoinHandle<()>>,
+	retention_task: Option<tokio::task::AbortHandle>,
 }
 
 impl RequestLogStoreGuard {
 	pub async fn shutdown_and_wait(mut self) {
+		if let Some(task) = self.retention_task.take() {
+			// The sweep holds a sender clone; abort so it cannot outlive shutdown.
+			task.abort();
+		}
 		let _ = self.tx.send(LogStoreMsg::Shutdown);
 		if let Some(writer) = self.writer.take() {
 			match tokio::task::spawn_blocking(move || writer.join()).await {
@@ -179,6 +281,9 @@ impl RequestLogStoreGuard {
 
 impl Drop for RequestLogStoreGuard {
 	fn drop(&mut self) {
+		if let Some(task) = self.retention_task.take() {
+			task.abort();
+		}
 		let _ = self.tx.send(LogStoreMsg::Shutdown);
 	}
 }
@@ -216,6 +321,10 @@ enum LogStoreMsg {
 	},
 	FeedbackExport {
 		tx: QueryResponse<Vec<FeedbackEntry>>,
+	},
+	Purge {
+		request: PurgeRequest,
+		tx: QueryResponse<PurgeResponse>,
 	},
 	Shutdown,
 }
@@ -293,7 +402,9 @@ impl LogStoreWorker {
 		loop {
 			match self.receiver.recv() {
 				Ok(msg) => {
-					if process_log_store_msg(&backend, &mut batch, msg).await {
+					if process_log_store_msg(&backend, &mut batch, self.cfg.max_payload_bytes, msg)
+						.await
+					{
 						self.drain_available_messages(&backend, &mut batch).await;
 						break;
 					}
@@ -308,7 +419,9 @@ impl LogStoreWorker {
 			while batch.len() < batch.capacity() {
 				match self.receiver.try_recv() {
 					Ok(msg) => {
-						if process_log_store_msg(&backend, &mut batch, msg).await {
+						if process_log_store_msg(&backend, &mut batch, self.cfg.max_payload_bytes, msg)
+							.await
+						{
 							shutdown = true;
 							break;
 						}
@@ -332,7 +445,8 @@ impl LogStoreWorker {
 		loop {
 			match self.receiver.try_recv() {
 				Ok(msg) => {
-					let _ = process_log_store_msg(backend, batch, msg).await;
+					let _ =
+						process_log_store_msg(backend, batch, self.cfg.max_payload_bytes, msg).await;
 				},
 				Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
 			}
@@ -363,6 +477,7 @@ fn log_store_batch_size() -> anyhow::Result<usize> {
 async fn process_log_store_msg(
 	backend: &Backend,
 	batch: &mut Vec<StoredRequestLog>,
+	max_payload_bytes: Option<usize>,
 	msg: LogStoreMsg,
 ) -> bool {
 	match msg {
@@ -373,6 +488,13 @@ async fn process_log_store_msg(
 				pending.input_messages.as_deref().map(Vec::as_slice),
 				pending.llm_response.as_ref(),
 			);
+			if let Some(cap) = max_payload_bytes
+				&& record.payload.as_ref().is_some_and(|payload| !payload_within_limit(payload, cap))
+			{
+				// Oversized payloads degrade to a metadata-only row rather than
+				// being stored (or held in the batch) in full.
+				record.payload = None;
+			}
 			record.has_payload = record.payload.is_some();
 			batch.push(record);
 			false
@@ -412,8 +534,23 @@ async fn process_log_store_msg(
 			let _ = tx.send(backend.feedback_export().await);
 			false
 		},
+		LogStoreMsg::Purge { request, tx } => {
+			flush_log_store_batch(backend, batch).await;
+			let _ = tx.send(backend.purge(request).await);
+			false
+		},
 		LogStoreMsg::Shutdown => true,
 	}
+}
+
+/// True when both payload halves serialize within `cap`; a half that fails to
+/// serialize counts as over the limit.
+fn payload_within_limit(payload: &StoredRequestLogPayload, cap: usize) -> bool {
+	[&payload.request_prompt_json, &payload.response_completion_json].into_iter().all(|half| {
+		half.as_ref().is_none_or(|value| {
+			serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= cap)
+		})
+	})
 }
 
 async fn flush_log_store_batch(backend: &Backend, batch: &mut Vec<StoredRequestLog>) {
@@ -1206,5 +1343,74 @@ impl Backend {
 			Self::Sqlite(store) => store.feedback_export().await,
 			Self::Postgres(store) => store.feedback_export().await,
 		}
+	}
+
+	async fn purge(&self, request: PurgeRequest) -> anyhow::Result<PurgeResponse> {
+		match self {
+			Self::Sqlite(store) => store.purge(request).await,
+			Self::Postgres(store) => store.purge(request).await,
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn payload_within_limit_checks_both_halves() {
+		let small = StoredRequestLogPayload {
+			request_prompt_json: Some(serde_json::json!({"prompt": "hi"})),
+			response_completion_json: None,
+		};
+		assert!(payload_within_limit(&small, 64));
+		assert!(!payload_within_limit(&small, 4), "request half over the cap");
+
+		let big = StoredRequestLogPayload {
+			request_prompt_json: None,
+			response_completion_json: Some(serde_json::json!({"completion": "a very long completion"})),
+		};
+		assert!(!payload_within_limit(&big, 8), "response half over the cap");
+		assert!(payload_within_limit(&big, 128));
+	}
+
+	#[test]
+	fn retention_config_parses_human_durations() {
+		let config: Config = serde_json::from_value(serde_json::json!({
+			"url": "sqlite://logs.db",
+			"retention": { "maxAge": "720h" }
+		}))
+		.unwrap();
+		let retention = config.retention.expect("retention present");
+		assert_eq!(retention.max_age, std::time::Duration::from_secs(720 * 3600));
+		assert_eq!(
+			retention.sweep_interval(),
+			std::time::Duration::from_secs(3600),
+			"interval defaults to hourly"
+		);
+
+		let with_interval: Config = serde_json::from_value(serde_json::json!({
+			"url": "sqlite://logs.db",
+			"retention": { "maxAge": "30d", "interval": "15m" }
+		}))
+		.unwrap();
+		let retention = with_interval.retention.expect("retention present");
+		assert_eq!(
+			retention.max_age,
+			std::time::Duration::from_secs(30 * 24 * 3600)
+		);
+		assert_eq!(
+			retention.sweep_interval(),
+			std::time::Duration::from_secs(15 * 60)
+		);
+	}
+
+	#[test]
+	fn retention_config_rejects_invalid_durations() {
+		let config = serde_json::from_value::<Config>(serde_json::json!({
+			"url": "sqlite://logs.db",
+			"retention": { "maxAge": "soon" }
+		}));
+		assert!(config.is_err(), "nonduration strings must not parse");
 	}
 }

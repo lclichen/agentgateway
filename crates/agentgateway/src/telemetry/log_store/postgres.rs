@@ -24,6 +24,8 @@ pub struct PostgresLogStore {
 }
 
 const ANALYTICS_FILTER_OPTION_LIMIT: i64 = 500;
+/// Rows removed per purge transaction; keeps each transaction short.
+const PURGE_BATCH_SIZE: i64 = 500;
 const SCHEMA_LOCK_TIMEOUT: &str = "10s";
 
 impl PostgresLogStore {
@@ -440,6 +442,39 @@ impl PostgresLogStore {
 				})
 			})
 			.collect()
+	}
+
+	/// Delete logs completed before the cutoff in bounded batches; payload rows
+	/// go with their logs in the same transaction. Space is reclaimed by
+	/// autovacuum, so no explicit VACUUM here.
+	pub async fn purge(&self, request: super::PurgeRequest) -> anyhow::Result<super::PurgeResponse> {
+		let mut deleted_logs = 0u64;
+		loop {
+			let mut tx = self.pool.begin().await?;
+			sqlx::query(
+				"DELETE FROM request_log_payloads WHERE log_id IN (\
+				 SELECT id FROM request_logs WHERE completed_at < $1 ORDER BY id LIMIT $2)",
+			)
+			.bind(request.before)
+			.bind(PURGE_BATCH_SIZE)
+			.execute(&mut *tx)
+			.await?;
+			let removed = sqlx::query(
+				"DELETE FROM request_logs WHERE id IN (\
+				 SELECT id FROM request_logs WHERE completed_at < $1 ORDER BY id LIMIT $2)",
+			)
+			.bind(request.before)
+			.bind(PURGE_BATCH_SIZE)
+			.execute(&mut *tx)
+			.await?
+			.rows_affected();
+			tx.commit().await?;
+			if removed == 0 {
+				break;
+			}
+			deleted_logs += removed;
+		}
+		Ok(super::PurgeResponse { deleted_logs })
 	}
 }
 
