@@ -51,3 +51,17 @@ cfg.yaml
 /agw-ui-test.db*
 /gateway-run.log
 /ui-test-config.yaml
+
+# local test-run leftovers (sqlite side files, ad-hoc gateway configs/logs)
+*.db-shm
+*.db-wal
+/gw-debug.log
+/mlflow*
+/mybinary*
+/eff-check.json
+/models-api-sample.json
+/linux-artifact/
+
+# local agent-tool state
+.zcode/
+.zcodeignore
