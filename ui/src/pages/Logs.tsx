@@ -118,6 +118,7 @@ export function LogsPage() {
 	);
 	const [status, setStatus] = useState('');
 	const [sessionFilter, setSessionFilter] = useState('');
+	const [logIdFilter, setLogIdFilter] = useState('');
 	const [stream, setStream] = useState(false);
 	const [response, setResponse] = useState<SearchLogsResponse>({ logs: [] });
 	const [expanded, setExpanded] = useState<LogEntry | null>(null);
@@ -133,12 +134,14 @@ export function LogsPage() {
 	const filters = useMemo(() => {
 		const base = analyticsLogFilters(logFilters);
 		const session = sessionFilter.trim();
+		const logId = logIdFilter.trim();
 		return {
 			...base,
 			httpStatus: status ? [Number(status)] : [],
+			...(logId ? { logId } : {}),
 			...(session ? { attributes: { ...base.attributes, 'agentgateway.session': session } } : {})
 		};
-	}, [logFilters, status, sessionFilter]);
+	}, [logFilters, status, sessionFilter, logIdFilter]);
 	const visibleLogs = useMemo(() => {
 		if (!expanded || !expandedId || response.logs.some(entry => entry.id === expandedId))
 			return response.logs;
@@ -167,7 +170,7 @@ export function LogsPage() {
 	}, [filters]);
 
 	useEffect(() => {
-		const timer = setTimeout(() => void load(), sessionFilter ? 300 : 0);
+		const timer = setTimeout(() => void load(), sessionFilter || logIdFilter ? 300 : 0);
 		return () => clearTimeout(timer);
 	}, [load]);
 
@@ -394,6 +397,15 @@ export function LogsPage() {
 							onChange={event => setSessionFilter(event.target.value)}
 						/>
 					</FieldGroup>
+					<FieldGroup label="Request">
+						<input
+							type="text"
+							value={logIdFilter}
+							placeholder="Request id prefix"
+							spellCheck={false}
+							onChange={event => setLogIdFilter(event.target.value)}
+						/>
+					</FieldGroup>
 					<label className="toggle-row logs-stream-toggle">
 						<input
 							type="checkbox"
@@ -402,7 +414,7 @@ export function LogsPage() {
 						/>
 						Stream
 					</label>
-					{hasAnalyticsFilters(logFilters) || status || sessionFilter ? (
+					{hasAnalyticsFilters(logFilters) || status || sessionFilter || logIdFilter ? (
 						<button
 							className="button"
 							type="button"
@@ -412,6 +424,7 @@ export function LogsPage() {
 								);
 								setStatus('');
 								setSessionFilter('');
+								setLogIdFilter('');
 							}}
 						>
 							Clear filters

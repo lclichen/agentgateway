@@ -11,7 +11,7 @@ use super::{
 	PayloadEntry, SearchRequest, SearchResponse, SessionSummary, SessionsRequest, SessionsResponse,
 	StoredRequestLog, StoredRequestLogPayload, TTFT_BOUNDS_MS, TailRequest, TailResponse,
 	TimeRange, TurnEntry, UsageEntry, analytics_window, attr_filter_values, decode_cursor,
-	encode_cursor, groups_from_buckets, histogram_bucket_sql, limit,
+	encode_cursor, groups_from_buckets, histogram_bucket_sql, like_prefix, limit, log_id_prefix,
 	promoted_attribute_column, prompt_preview, truncate_snippet, turn_kind,
 };
 
@@ -357,7 +357,10 @@ impl SqliteLogStore {
 			 MIN(id) AS first_log_id, MAX(id) AS last_log_id \
 			 FROM request_logs WHERE agentgateway_session IS NOT NULL AND agentgateway_session != ''",
 		);
-		push_filters(&mut qb, request.time_range.as_ref(), &request.filters);
+		// A log id prefix would filter member rows and skew per-session stats; ignore it here.
+		let mut member_filters = request.filters.clone();
+		member_filters.log_id = None;
+		push_filters(&mut qb, request.time_range.as_ref(), &member_filters);
 		qb.push(" GROUP BY agentgateway_session");
 		if let Some(cursor) = request.cursor.as_deref() {
 			let (last_seen, session) = decode_cursor(cursor)?;
@@ -612,6 +615,11 @@ fn push_filters(
 	if let Some(trace_id) = &filters.trace_id {
 		qb.push(" AND trace_id = ");
 		qb.push_bind(trace_id);
+	}
+	if let Some(prefix) = log_id_prefix(filters) {
+		qb.push(" AND id LIKE ");
+		qb.push_bind(like_prefix(prefix));
+		qb.push(" ESCAPE '\\'");
 	}
 	if let Some(has_payload) = filters.has_payload {
 		qb.push(" AND has_payload = ");
@@ -993,6 +1001,93 @@ INSERT INTO request_logs VALUES (
 	}
 
 	#[tokio::test]
+	async fn search_filters_by_log_id_prefix() {
+		let store = SqliteLogStore::from_pool(memory_pool().await)
+			.await
+			.unwrap();
+		let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+		store
+			.insert_batch(&[
+				sample("0198aaaa-target", Some("session-a"), base, None),
+				sample("0198bbbb-other", Some("session-b"), base, None),
+			])
+			.await
+			.unwrap();
+
+		let search = |log_id: Option<&str>| {
+			store.search(SearchRequest {
+				limit: Some(10),
+				cursor: None,
+				time_range: None,
+				filters: LogFilters {
+					log_id: log_id.map(str::to_string),
+					..Default::default()
+				},
+				include_attributes: false,
+				include_payload: false,
+			})
+		};
+
+		let matched = search(Some("0198aaaa")).await.unwrap();
+		assert_eq!(matched.logs.len(), 1);
+		assert_eq!(matched.logs[0].id, "0198aaaa-target");
+
+		// LIKE wildcards in the prefix must match literally, never broaden.
+		let literal = search(Some("0198%")).await.unwrap();
+		assert_eq!(literal.logs.len(), 0);
+
+		let none = search(Some("ffff")).await.unwrap();
+		assert_eq!(none.logs.len(), 0);
+	}
+
+	#[tokio::test]
+	async fn search_sessions_ignores_log_id_filter() {
+		let store = SqliteLogStore::from_pool(memory_pool().await)
+			.await
+			.unwrap();
+		let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+		store
+			.insert_batch(&[
+				sample("0001", Some("session-a"), base, None),
+				sample(
+					"0002",
+					Some("session-a"),
+					base + chrono::Duration::seconds(10),
+					None,
+				),
+				sample(
+					"0003",
+					Some("session-b"),
+					base + chrono::Duration::seconds(5),
+					None,
+				),
+			])
+			.await
+			.unwrap();
+
+		let response = store
+			.search_sessions(SessionsRequest {
+				limit: Some(10),
+				filters: LogFilters {
+					log_id: Some("0001".to_string()),
+					..Default::default()
+				},
+				..Default::default()
+			})
+			.await
+			.unwrap();
+
+		// The id filter is dropped on the aggregate: session-a still reports both calls.
+		let a = response
+			.sessions
+			.iter()
+			.find(|s| s.session == "session-a")
+			.expect("session-a");
+		assert_eq!(a.requests, 2);
+		assert_eq!(response.sessions.len(), 2);
+	}
+
+	#[tokio::test]
 	async fn search_sessions_aggregates_by_session() {
 		let store = SqliteLogStore::from_pool(memory_pool().await)
 			.await
@@ -1088,7 +1183,12 @@ INSERT INTO request_logs VALUES (
 			None,
 		);
 		a2.agentgateway_user = Some("alice".to_string());
-		let mut b = sample("0003", Some("session-b"), base + chrono::Duration::seconds(5), None);
+		let mut b = sample(
+			"0003",
+			Some("session-b"),
+			base + chrono::Duration::seconds(5),
+			None,
+		);
 		b.agentgateway_user = Some("bob".to_string());
 		// session-c spans two users; the aggregate reports only one of them.
 		let mut c1 = sample(

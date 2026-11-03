@@ -15,7 +15,7 @@ use super::{
 	PayloadEntry, SearchRequest, SearchResponse, SessionSummary, SessionsRequest, SessionsResponse,
 	StoredRequestLog, StoredRequestLogPayload, TTFT_BOUNDS_MS, TailRequest, TailResponse,
 	TimeRange, TurnEntry, UsageEntry, analytics_window, attr_filter_values, decode_cursor,
-	encode_cursor, groups_from_buckets, histogram_bucket_sql, limit,
+	encode_cursor, groups_from_buckets, histogram_bucket_sql, like_prefix, limit, log_id_prefix,
 	promoted_attribute_column, prompt_preview, truncate_snippet, turn_kind,
 };
 
@@ -266,7 +266,10 @@ impl PostgresLogStore {
 			 MIN(id) AS first_log_id, MAX(id) AS last_log_id \
 			 FROM request_logs WHERE agentgateway_session IS NOT NULL AND agentgateway_session != ''",
 		);
-		push_filters(&mut qb, request.time_range.as_ref(), &request.filters);
+		// A log id prefix would filter member rows and skew per-session stats; ignore it here.
+		let mut member_filters = request.filters.clone();
+		member_filters.log_id = None;
+		push_filters(&mut qb, request.time_range.as_ref(), &member_filters);
 		qb.push(" GROUP BY agentgateway_session");
 		if let Some(cursor) = request.cursor.as_deref() {
 			let (last_seen, session) = decode_cursor(cursor)?;
@@ -629,6 +632,11 @@ fn push_filters(
 	if let Some(trace_id) = &filters.trace_id {
 		qb.push(" AND trace_id = ");
 		qb.push_bind(trace_id);
+	}
+	if let Some(prefix) = log_id_prefix(filters) {
+		qb.push(" AND id LIKE ");
+		qb.push_bind(like_prefix(prefix));
+		qb.push(" ESCAPE '\\'");
 	}
 	if let Some(has_payload) = filters.has_payload {
 		qb.push(" AND has_payload = ");

@@ -158,6 +158,7 @@ export interface LogFilters {
 	requestModel?: string[];
 	responseModel?: string[];
 	traceId?: string | null;
+	logId?: string | null;
 	hasPayload?: boolean | null;
 	attributes?: Record<string, unknown>;
 }

@@ -35,6 +35,7 @@ export function SessionsPage() {
 	const [loadingMore, setLoadingMore] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const [sessionId, setSessionId] = useState<string | null>(() => queryParam('session'));
+	const [sessionFilter, setSessionFilter] = useState('');
 	const [userFilter, setUserFilter] = useState('');
 	const [timeRange, setTimeRange] = useState<LogTimeRange>({ mode: 'all' });
 	const loadSeqRef = useRef(0);
@@ -56,11 +57,15 @@ export function SessionsPage() {
 		setError(null);
 		try {
 			const user = userFilter.trim();
+			const session = sessionFilter.trim();
+			const attributes: Record<string, string> = {};
+			if (user) attributes['agentgateway.user'] = user;
+			if (session) attributes['agentgateway.session'] = session;
 			const response = await searchSessions({
 				limit: SESSION_PAGE_SIZE,
 				cursor,
 				timeRange: logTimeRangeToApi(timeRange),
-				filters: user ? { attributes: { 'agentgateway.user': user } } : undefined
+				filters: Object.keys(attributes).length ? { attributes } : undefined
 			});
 			if (loadSeq !== loadSeqRef.current) return;
 			setSessions(current => (cursor ? [...current, ...response.sessions] : response.sessions));
@@ -78,9 +83,9 @@ export function SessionsPage() {
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: load reads the latest filter state by closure; only these deps should trigger a reload.
 	useEffect(() => {
-		const timer = setTimeout(() => void load(), userFilter ? 300 : 0);
+		const timer = setTimeout(() => void load(), userFilter || sessionFilter ? 300 : 0);
 		return () => clearTimeout(timer);
-	}, [userFilter, timeRange]);
+	}, [userFilter, sessionFilter, timeRange]);
 
 	function openSession(id: string | null) {
 		setSessionId(id);
@@ -100,7 +105,8 @@ export function SessionsPage() {
 	const selected = sessionId
 		? (sessions.find(session => session.session === sessionId) ?? null)
 		: null;
-	const hasActiveFilters = Boolean(userFilter.trim()) || timeRange.mode !== 'all';
+	const hasActiveFilters =
+		Boolean(userFilter.trim()) || Boolean(sessionFilter.trim()) || timeRange.mode !== 'all';
 
 	return (
 		<div className="page-stack">
@@ -124,6 +130,15 @@ export function SessionsPage() {
 			) : (
 				<Panel className="logs-results-panel">
 					<div className="logs-filter-bar">
+						<FieldGroup label="Session">
+							<input
+								type="text"
+								value={sessionFilter}
+								placeholder="Session id"
+								spellCheck={false}
+								onChange={event => setSessionFilter(event.target.value)}
+							/>
+						</FieldGroup>
 						<FieldGroup label="User">
 							<input
 								type="text"
@@ -139,7 +154,7 @@ export function SessionsPage() {
 							title={hasActiveFilters ? 'No matching sessions' : 'No sessions yet'}
 							description={
 								hasActiveFilters
-									? 'No sessions match the current user and time filters.'
+									? 'No sessions match the current session, user, and time filters.'
 									: 'Sessions group requests that share a session id header (x-session-id). Ensure request logging is enabled and clients send session ids.'
 							}
 						/>

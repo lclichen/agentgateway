@@ -505,10 +505,39 @@ pub struct LogFilters {
 	pub response_model: Vec<String>,
 	#[serde(default)]
 	pub trace_id: Option<String>,
+	/// Request log id prefix match, for jumping straight to a known request.
+	#[serde(default)]
+	pub log_id: Option<String>,
 	#[serde(default)]
 	pub has_payload: Option<bool>,
 	#[serde(default)]
 	pub attributes: BTreeMap<String, Value>,
+}
+
+/// Trimmed non-empty log id prefix, if any.
+pub(crate) fn log_id_prefix(filters: &LogFilters) -> Option<&str> {
+	filters
+		.log_id
+		.as_deref()
+		.map(str::trim)
+		.filter(|value| !value.is_empty())
+}
+
+/// Escape LIKE wildcards so the value matches literally; pair with `ESCAPE '\'`.
+fn escape_like(value: &str) -> String {
+	let mut escaped = String::with_capacity(value.len());
+	for char in value.chars() {
+		if matches!(char, '%' | '_' | '\\') {
+			escaped.push('\\');
+		}
+		escaped.push(char);
+	}
+	escaped
+}
+
+/// The LIKE pattern for a log id prefix search.
+pub(crate) fn like_prefix(value: &str) -> String {
+	format!("{}%", escape_like(value))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
