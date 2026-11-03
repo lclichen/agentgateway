@@ -43,6 +43,7 @@ pub const DEFAULT_BUFFER_LIMIT: usize = 32 * 1024 * 1024;
 pub mod catalog;
 pub mod discovery;
 pub mod policy;
+pub mod provider_discovery;
 
 use policy::streaming_guardrails::GuardedSseBody;
 pub use types::{OutputMessage, OutputMessagePart, ToolCall};

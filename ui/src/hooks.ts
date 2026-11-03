@@ -355,6 +355,24 @@ type UpsertConfigResourceInput = {
 	};
 }[ConfigResourceKind];
 
+type PutConfigResourcesInput = {
+	[K in ConfigResourceKind]: {
+		kind: K;
+		values: ConfigResourceValue<K>[];
+	};
+}[ConfigResourceKind];
+
+export function usePutConfigResources() {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: async (input: PutConfigResourcesInput) => {
+			await requireWritableRuntime(queryClient);
+			await putConfigResources(input.kind, input.values);
+		},
+		onSuccess: () => invalidateConfigViews(queryClient)
+	});
+}
+
 export function useDeleteConfigResource() {
 	const queryClient = useQueryClient();
 	return useMutation({

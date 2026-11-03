@@ -2,6 +2,8 @@ import { Link } from '@tanstack/react-router';
 import { Bot, Pencil, Plus, Trash2 } from 'lucide-react';
 import { useState } from 'react';
 
+import type { DiscoveredModel } from '@/api/providersApi';
+import { discoverProviderModels } from '@/api/providersApi';
 import { ConfigDiffSaveActions } from '@/components/ConfigDiffDrawer';
 import { LostFieldsWarning, useMergedEdits } from '@/components/EditorContracts';
 import {
@@ -9,6 +11,7 @@ import {
 	Drawer,
 	EmptyState,
 	Field,
+	FieldGroup,
 	PageHeader,
 	Panel,
 	StatusBanner,
@@ -24,7 +27,12 @@ import {
 	upsertLlmProvider
 } from '@/config';
 import { useStickyQueryParam } from '@/drawerRouteState';
-import { useDeleteConfigResource, useLlmConfigData, useUpsertConfigResource } from '@/hooks';
+import {
+	useDeleteConfigResource,
+	useLlmConfigData,
+	usePutConfigResources,
+	useUpsertConfigResource
+} from '@/hooks';
 import { ProviderConfigEditor } from '@/pages/models/ProviderConfigEditor';
 import { cleanEmpty } from '@/policies/policyUtils';
 import { type SchemaHelp, useSchemaHelp } from '@/schemaHelp';
@@ -33,6 +41,7 @@ import type { GatewayConfig, LlmModel, LlmProvider, ProviderName } from '@/types
 export function ProvidersPage() {
 	const { config, hybrid, resources, models, providers, isLoading, error } = useLlmConfigData();
 	const upsertResource = useUpsertConfigResource();
+	const putResources = usePutConfigResources();
 	const deleteResource = useDeleteConfigResource();
 	const help = useSchemaHelp();
 	const [editing, setEditing] = useState<{
@@ -80,19 +89,51 @@ export function ProvidersPage() {
 		setProviderDrawer(null, 'replace');
 	}
 
-	const saving = upsertResource.isPending || deleteResource.isPending;
-	const saveError = upsertResource.error?.message ?? deleteResource.error?.message ?? null;
+	const saving = upsertResource.isPending || deleteResource.isPending || putResources.isPending;
+	const saveError =
+		upsertResource.error?.message ??
+		deleteResource.error?.message ??
+		putResources.error?.message ??
+		null;
 	const saved = upsertResource.isSuccess || deleteResource.isSuccess;
 
 	function resetSaves() {
 		upsertResource.reset();
 		deleteResource.reset();
+		putResources.reset();
 	}
 
-	function saveProvider(provider: LlmProvider, previousName?: string) {
+	function saveProvider(
+		provider: LlmProvider,
+		previousName?: string,
+		discoveredModels?: DiscoveredModel[]
+	) {
 		upsertResource.mutate(
 			{ kind: 'llm.provider', value: provider, previousId: previousName },
-			{ onSuccess: closeProviderEditor }
+			{
+				onSuccess: () => {
+					if (discoveredModels?.length) {
+						const existing = new Set(models.map(model => model.name));
+						const toAdd = discoveredModels.filter(model => !existing.has(model.id));
+						if (toAdd.length) {
+							putResources.mutate({
+								kind: 'llm.model',
+								values: toAdd.map((model): LlmModel => {
+									const metadata: LlmModel['metadata'] = {};
+									if (model.contextLength) metadata.contextLength = model.contextLength;
+									if (model.maxOutputTokens) metadata.maxOutputTokens = model.maxOutputTokens;
+									return {
+										name: model.id,
+										provider: { reference: provider.name },
+										...(Object.keys(metadata).length ? { metadata } : {})
+									};
+								})
+							});
+						}
+					}
+					closeProviderEditor();
+				}
+			}
 		);
 	}
 
@@ -246,6 +287,7 @@ export function ProvidersPage() {
 					previousName={activeEditing.previousName}
 					help={help}
 					saving={saving}
+					existingModelNames={models.map(model => model.name)}
 					onCancel={closeProviderEditor}
 					onSave={saveProvider}
 				/>
@@ -275,8 +317,13 @@ function ProviderEditor(props: {
 	previousName?: string;
 	help: SchemaHelp;
 	saving: boolean;
+	existingModelNames: string[];
 	onCancel: () => void;
-	onSave: (provider: LlmProvider, previousName?: string) => void;
+	onSave: (
+		provider: LlmProvider,
+		previousName?: string,
+		discoveredModels?: DiscoveredModel[]
+	) => void;
 }) {
 	const [provider, setProvider] = useState<LlmProvider>(props.initial);
 	const [initialDraft] = useState(() => JSON.stringify(props.initial));
@@ -287,6 +334,7 @@ function ProviderEditor(props: {
 		['$defs', 'LocalLLMProvider']
 	);
 	const preview = merged.value;
+	const [discoveredModels, setDiscoveredModels] = useState<DiscoveredModel[]>([]);
 	const invalidApiKey = invalidProviderApiKey(provider.params?.apiKey);
 	const providerApiKeyError =
 		saveAttempted && invalidApiKey ? 'Enter a value, or choose Unset.' : null;
@@ -294,7 +342,7 @@ function ProviderEditor(props: {
 	function save() {
 		setSaveAttempted(true);
 		if (invalidApiKey) return;
-		props.onSave(preview ?? provider, props.previousName);
+		props.onSave(preview ?? provider, props.previousName, discoveredModels);
 	}
 
 	function validateBeforeDiff() {
@@ -382,7 +430,148 @@ function ProviderEditor(props: {
 					}))
 				}
 			/>
+			<DiscoverModelsSection
+				provider={provider}
+				previousName={props.previousName}
+				existingModelNames={props.existingModelNames}
+				selected={discoveredModels}
+				onSelectedChange={setDiscoveredModels}
+			/>
 		</Drawer>
+	);
+}
+
+function DiscoverModelsSection(props: {
+	provider: LlmProvider;
+	previousName?: string;
+	existingModelNames: string[];
+	selected: DiscoveredModel[];
+	onSelectedChange: (models: DiscoveredModel[]) => void;
+}) {
+	const [loading, setLoading] = useState(false);
+	const [error, setError] = useState<string | null>(null);
+	const [result, setResult] = useState<{ endpoint: string; models: DiscoveredModel[] } | null>(
+		null
+	);
+
+	async function discover() {
+		setLoading(true);
+		setError(null);
+		try {
+			const response = await discoverProviderModels({
+				name: props.previousName ?? props.provider.name.trim(),
+				provider: props.provider
+			});
+			setResult(response);
+			// Opt-in selection: discovering must not mass-create models on a
+			// later accidental save. "Select new" picks the unconfigured ones.
+			props.onSelectedChange([]);
+		} catch (err) {
+			setResult(null);
+			setError(err instanceof Error ? err.message : 'Discovery failed');
+			props.onSelectedChange([]);
+		} finally {
+			setLoading(false);
+		}
+	}
+
+	function toggle(model: DiscoveredModel, checked: boolean) {
+		props.onSelectedChange(
+			checked ? [...props.selected, model] : props.selected.filter(entry => entry.id !== model.id)
+		);
+	}
+
+	const existingSet = new Set(props.existingModelNames);
+	const selectable = result?.models.filter(model => !existingSet.has(model.id)) ?? [];
+
+	return (
+		<section className="discover-models">
+			<FieldGroup
+				label="Discover models"
+				tooltip="Probe the provider's OpenAI-compatible /v1/models endpoint and add the models you want as llm.model entries."
+			>
+				<div className="discover-models-actions">
+					<button
+						className="button"
+						type="button"
+						disabled={loading || !props.provider.name.trim()}
+						onClick={() => void discover()}
+					>
+						{loading ? 'Discovering…' : result ? 'Refresh models' : 'Discover upstream models'}
+					</button>
+					{result ? (
+						<span className="muted">
+							{result.models.length} models · {result.endpoint}
+						</span>
+					) : (
+						<span className="muted">Requires a baseUrl (or a provider preset).</span>
+					)}
+				</div>
+			</FieldGroup>
+			{error ? (
+				<StatusBanner state="bad" title="Model discovery failed">
+					{error}
+				</StatusBanner>
+			) : null}
+			{result && result.models.length === 0 ? (
+				<StatusBanner state="warn" title="No models reported">
+					The upstream model list at {result.endpoint} is empty.
+				</StatusBanner>
+			) : null}
+			{result && result.models.length > 0 ? (
+				<div className="discover-models-list">
+					<div className="discover-models-list-actions">
+						<button
+							className="button small"
+							type="button"
+							onClick={() => props.onSelectedChange(selectable)}
+						>
+							Select new
+						</button>
+						<button
+							className="button small"
+							type="button"
+							onClick={() => props.onSelectedChange([])}
+						>
+							Clear
+						</button>
+						<span className="muted">
+							{props.selected.length} selected · added when you save the provider
+						</span>
+					</div>
+					<div className="discover-models-scroll">
+						{result.models.map(model => {
+							const existing = existingSet.has(model.id);
+							const checked = props.selected.some(entry => entry.id === model.id);
+							return (
+								<label key={model.id} className="toggle-row discover-model-row">
+									<input
+										type="checkbox"
+										checked={checked}
+										disabled={existing}
+										onChange={event => toggle(model, event.target.checked)}
+									/>
+									<span className="discover-model-id">{model.id}</span>
+									{existing ? (
+										<span className="muted">already configured</span>
+									) : (
+										<span className="muted">
+											{[
+												model.contextLength ? `ctx ${model.contextLength}` : null,
+												model.maxOutputTokens ? `out ${model.maxOutputTokens}` : null,
+												model.ownedBy
+											]
+												.filter(Boolean)
+												.join(' · ')}
+										</span>
+									)}
+								</label>
+							);
+						})}
+					</div>
+				</div>
+			) : null}
+		</section>
 	);
 }
 

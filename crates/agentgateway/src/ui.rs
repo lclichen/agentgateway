@@ -120,6 +120,10 @@ pub fn router(
 		.route("/api/logs/analytics/summary", post(analytics_summary))
 		.route("/api/costs/models", get(cost_models))
 		.route("/api/costs/refresh-base", post(refresh_base_costs))
+		.route(
+			"/api/providers/discover-models",
+			post(discover_provider_models),
+		)
 		.route("/api/budgets/status", get(budget_status));
 	let router = if assets_dir.entries().is_empty() {
 		router.route("/", get(crate::management::admin::handle_dashboard))
@@ -1083,6 +1087,75 @@ async fn refresh_base_costs(
 		);
 	}
 	Ok(Json(response))
+}
+
+async fn discover_provider_models(
+	State(app): State<App>,
+	Json(request): Json<crate::llm::provider_discovery::DiscoverModelsRequest>,
+) -> Result<Json<crate::llm::provider_discovery::DiscoverModelsResponse>, ErrorResponse> {
+	// Discovery resolves saved provider secrets, so gate it like a config write
+	// rather than a read-only log query.
+	app.ensure_writable()?;
+	let name = request
+		.name
+		.as_deref()
+		.map(str::trim)
+		.filter(|name| !name.is_empty());
+	let stored = match name {
+		Some(name) => resolve_stored_provider(&app, name).await?,
+		None => None,
+	};
+	let provider = match (stored, request.provider) {
+		(Some(stored), Some(draft)) => {
+			crate::llm::provider_discovery::merge_draft_over_stored(&stored, &draft)
+		},
+		(Some(stored), None) => stored,
+		(None, Some(draft)) => draft,
+		(None, None) => {
+			return Err(ErrorResponse::String(
+				"provide a provider draft or a saved provider name".to_string(),
+			));
+		},
+	};
+	crate::llm::provider_discovery::discover_models(&provider)
+		.await
+		.map(Json)
+		.map_err(ErrorResponse::Anyhow)
+}
+
+/// The stored provider value, server-side, so redacted UI secrets can be resolved.
+async fn resolve_stored_provider(app: &App, name: &str) -> Result<Option<Value>, ErrorResponse> {
+	if app.state.storage.mode == ConfigStoreMode::Hybrid {
+		let store = app.config_resource_store()?;
+		let resources = store.list(None).await.map_err(resource_api_error)?;
+		return Ok(
+			resources
+				.iter()
+				.find(|resource| {
+					resource.kind == ConfigResourceKind::LlmProvider && resource_name(&resource.value) == name
+				})
+				.map(|resource| resource.value.clone()),
+		);
+	}
+	let config = read_file_config(app).await?;
+	Ok(
+		config
+			.pointer("/llm/providers")
+			.and_then(Value::as_array)
+			.and_then(|providers| {
+				providers
+					.iter()
+					.find(|provider| resource_name(provider) == name)
+			})
+			.cloned(),
+	)
+}
+
+fn resource_name(value: &Value) -> &str {
+	value
+		.get("name")
+		.and_then(Value::as_str)
+		.unwrap_or_default()
 }
 
 async fn cost_models(
