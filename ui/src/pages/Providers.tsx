@@ -122,6 +122,10 @@ export function ProvidersPage() {
 									const metadata: LlmModel['metadata'] = {};
 									if (model.contextLength) metadata.contextLength = model.contextLength;
 									if (model.maxOutputTokens) metadata.maxOutputTokens = model.maxOutputTokens;
+									if (model.inputModalities?.length)
+										metadata.inputModalities = model.inputModalities;
+									if (model.outputModalities?.length)
+										metadata.outputModalities = model.outputModalities;
 									return {
 										name: model.id,
 										provider: { reference: provider.name },

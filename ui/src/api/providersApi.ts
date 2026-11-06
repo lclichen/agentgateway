@@ -7,6 +7,8 @@ export interface DiscoveredModel {
 	created?: number;
 	contextLength?: number;
 	maxOutputTokens?: number;
+	inputModalities?: string[];
+	outputModalities?: string[];
 }
 
 export interface DiscoverModelsResponse {

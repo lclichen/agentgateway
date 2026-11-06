@@ -41,6 +41,12 @@ pub struct DiscoveredModel {
 	pub context_length: Option<i64>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub max_output_tokens: Option<i64>,
+	/// Upstream-advertised input modalities (llama.cpp's `architecture`
+	/// object), when present.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub input_modalities: Option<Vec<String>>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub output_modalities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -208,14 +214,33 @@ fn first_int(entry: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<i6
 
 fn parse_model_entry(entry: &Value) -> Option<DiscoveredModel> {
 	let object = entry.as_object()?;
-	let id = object.get("id")?.as_str()?.trim().to_string();
-	if id.is_empty() {
-		return None;
-	}
+	// OpenAI-style entries carry `id`; ollama-style `models[]` entries use
+	// `model`/`name` instead, so fall back through those.
+	let id = ["id", "model", "name"]
+		.iter()
+		.find_map(|key| object.get(*key).and_then(Value::as_str))
+		.map(str::trim)
+		.filter(|id| !id.is_empty())?
+		.to_string();
 	// llama.cpp puts limits under a `meta` object on some builds.
 	let meta = object.get("meta").and_then(Value::as_object);
 	let lookup = |keys: &[&str]| -> Option<i64> {
 		first_int(object, keys).or_else(|| meta.and_then(|meta| first_int(meta, keys)))
+	};
+	// llama.cpp's OpenAI-compat entries advertise modalities under
+	// `architecture`; absent on vLLM and plain OpenAI.
+	let architecture = object.get("architecture").and_then(Value::as_object);
+	let modalities = |key: &str| -> Option<Vec<String>> {
+		architecture
+			.and_then(|arch| arch.get(key))
+			.and_then(Value::as_array)
+			.map(|values| {
+				values
+					.iter()
+					.filter_map(|value| value.as_str().map(str::to_string))
+					.collect()
+			})
+			.filter(|values: &Vec<String>| !values.is_empty())
 	};
 	Some(DiscoveredModel {
 		id,
@@ -226,6 +251,8 @@ fn parse_model_entry(entry: &Value) -> Option<DiscoveredModel> {
 		created: object.get("created").and_then(Value::as_i64),
 		context_length: lookup(&CONTEXT_KEYS),
 		max_output_tokens: lookup(&OUTPUT_KEYS),
+		input_modalities: modalities("input_modalities"),
+		output_modalities: modalities("output_modalities"),
 	})
 }
 
@@ -367,5 +394,76 @@ mod tests {
 		let merged = merge_draft_over_stored(&stored, &draft);
 		assert_eq!(merged["params"]["baseUrl"], "http://y");
 		assert_eq!(merged["params"]["apiKey"], "new");
+	}
+
+	/// llama.cpp upstream format: both an ollama-style `models` array and an
+	/// OpenAI-style `data` array; discovery reads `data`, with limits under
+	/// `meta` and modalities under `architecture`.
+	#[test]
+	fn parse_llamacpp_data_entry_reads_meta_and_architecture() {
+		let payload = json!({
+			"models": [{"name": "Qwen3.8-27B-xhigh", "model": "Qwen3.8-27B-xhigh",
+				"modified_at": "", "size": "", "digest": "", "type": "model",
+				"description": "", "tags": [""], "capabilities": ["completion", "multimodal"],
+				"parameters": "", "details": {"parent_model": "", "format": "gguf",
+				"family": "", "families": [""], "parameter_size": "", "quantization_level": ""}}],
+			"object": "list",
+			"data": [{"id": "Qwen3.8-27B-xhigh", "aliases": ["Qwen3.8-27B-xhigh"],
+				"tags": [], "object": "model",
+				"architecture": {"input_modalities": ["text", "image", "video"],
+					"output_modalities": ["text"]},
+				"created": 1793943474, "owned_by": "llamacpp",
+				"meta": {"vocab_type": 2, "n_vocab": 248320, "n_ctx": 262144,
+					"n_ctx_train": 262144, "n_embd": 5120, "n_params": 27320697856i64,
+					"size": 17548181504i64, "ftype": "Q4_K - Medium"}}]
+		});
+		let data = payload.get("data").and_then(Value::as_array).unwrap();
+		let parsed = parse_model_entry(&data[0]).unwrap();
+		assert_eq!(parsed.id, "Qwen3.8-27B-xhigh");
+		assert_eq!(parsed.owned_by.as_deref(), Some("llamacpp"));
+		assert_eq!(parsed.created, Some(1793943474));
+		assert_eq!(parsed.context_length, Some(262144), "meta.n_ctx");
+		assert_eq!(parsed.max_output_tokens, None);
+		assert_eq!(
+			parsed.input_modalities.as_deref(),
+			Some(["text".to_string(), "image".to_string(), "video".to_string()].as_slice()),
+			"architecture.input_modalities"
+		);
+		assert_eq!(
+			parsed.output_modalities.as_deref(),
+			Some(["text".to_string()].as_slice())
+		);
+
+		// An ollama-style entry (models[] without `id`) still parses via the
+		// name/model fallback, for upstreams that only return that array.
+		let models = payload.get("models").and_then(Value::as_array).unwrap();
+		let parsed = parse_model_entry(&models[0]).unwrap();
+		assert_eq!(parsed.id, "Qwen3.8-27B-xhigh");
+		assert_eq!(parsed.context_length, None);
+	}
+
+	/// vLLM upstream format: `max_model_len` at the top level of each entry,
+	/// permission objects, and no architecture/modalities.
+	#[test]
+	fn parse_vllm_entry_reads_max_model_len() {
+		let payload = json!({
+			"object": "list",
+			"data": [{"id": "Qwen3.8-27B", "object": "model", "created": 1793943100,
+				"owned_by": "vllm", "root": "/litho_data/Qwen3.8/Qwen3.8-27B-BF16/",
+				"parent": null, "max_model_len": 262144,
+				"permission": [{"id": "modelperm-bbacc6d18b3662ac", "object": "model_permission",
+				"created": 1793943100, "allow_create_engine": false, "allow_sampling": true,
+				"allow_logprobs": true, "allow_search_indices": false, "allow_view": true,
+				"allow_fine_tuning": false, "organization": "*", "group": null,
+				"is_blocking": false}]}]
+		});
+		let data = payload.get("data").and_then(Value::as_array).unwrap();
+		let parsed = parse_model_entry(&data[0]).unwrap();
+		assert_eq!(parsed.id, "Qwen3.8-27B");
+		assert_eq!(parsed.owned_by.as_deref(), Some("vllm"));
+		assert_eq!(parsed.context_length, Some(262144), "max_model_len");
+		assert_eq!(parsed.max_output_tokens, None);
+		assert_eq!(parsed.input_modalities, None);
+		assert_eq!(parsed.output_modalities, None);
 	}
 }
