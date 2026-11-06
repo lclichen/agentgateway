@@ -215,12 +215,17 @@ fn first_int(entry: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<i6
 fn parse_model_entry(entry: &Value) -> Option<DiscoveredModel> {
 	let object = entry.as_object()?;
 	// OpenAI-style entries carry `id`; ollama-style `models[]` entries use
-	// `model`/`name` instead, so fall back through those.
+	// `model`/`name` instead, so fall back to the first key with a non-empty
+	// value (an empty id must not shadow a usable model/name).
 	let id = ["id", "model", "name"]
 		.iter()
-		.find_map(|key| object.get(*key).and_then(Value::as_str))
-		.map(str::trim)
-		.filter(|id| !id.is_empty())?
+		.find_map(|key| {
+			object
+				.get(*key)
+				.and_then(Value::as_str)
+				.map(str::trim)
+				.filter(|id| !id.is_empty())
+		})?
 		.to_string();
 	// llama.cpp puts limits under a `meta` object on some builds.
 	let meta = object.get("meta").and_then(Value::as_object);
