@@ -22,7 +22,15 @@ import {
 import { marked } from 'marked';
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
-import { analyticsSummary, getLog, purgeLogs, searchLogs, streamLogs } from '@/api/logsApi';
+import {
+	analyticsSummary,
+	deleteLogs,
+	getLog,
+	purgeLogs,
+	searchLogs,
+	streamLogs,
+	stripPayload
+} from '@/api/logsApi';
 import { ConfigDiffSaveActions } from '@/components/ConfigDiffDrawer';
 import {
 	bucketCountForRange,
@@ -38,6 +46,7 @@ import { EnumSelector } from '@/components/EnumSelector';
 import { MiniMonacoEditor } from '@/components/MiniMonacoEditor';
 import { MultiCheckboxDropdown } from '@/components/MultiCheckboxDropdown';
 import {
+	ConfirmDialog,
 	Drawer,
 	EmptyState,
 	FieldGroup,
@@ -128,6 +137,8 @@ export function LogsPage() {
 	const [status, setStatus] = useState('');
 	const [sessionFilter, setSessionFilter] = useState('');
 	const [logIdFilter, setLogIdFilter] = useState('');
+	// Off by default: /v1/models polling rows are noise unless debugging one.
+	const [includeModelList, setIncludeModelList] = useState(false);
 	const [stream, setStream] = useState(false);
 	const [response, setResponse] = useState<SearchLogsResponse>({ logs: [] });
 	const [expanded, setExpanded] = useState<LogEntry | null>(null);
@@ -143,6 +154,10 @@ export function LogsPage() {
 	const [purging, setPurging] = useState(false);
 	const [purgeMessage, setPurgeMessage] = useState<string | null>(null);
 	const [purgeError, setPurgeError] = useState<string | null>(null);
+	// Per-record destructive actions, confirmed through dialogs.
+	const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
+	const [stripTargetId, setStripTargetId] = useState<string | null>(null);
+	const [recordActionBusy, setRecordActionBusy] = useState(false);
 	const abortRef = useRef<AbortController | null>(null);
 	const loadSeqRef = useRef(0);
 	const detailSeqRef = useRef(0);
@@ -156,9 +171,10 @@ export function LogsPage() {
 			...base,
 			httpStatus: status ? [Number(status)] : [],
 			...(logId ? { logId } : {}),
+			...(includeModelList ? { includeModelList: true } : {}),
 			...(session ? { attributes: { ...base.attributes, 'agentgateway.session': session } } : {})
 		};
-	}, [logFilters, status, sessionFilter, logIdFilter]);
+	}, [logFilters, status, sessionFilter, logIdFilter, includeModelList]);
 	const visibleLogs = useMemo(() => {
 		if (!expanded || !expandedId || response.logs.some(entry => entry.id === expandedId))
 			return response.logs;
@@ -357,6 +373,50 @@ export function LogsPage() {
 		}
 	}
 
+	function collapseIfExpanded(id: string) {
+		if (expandedId !== id) return;
+		setLinkedLogQuery(null);
+		setExpandedId(null);
+		setExpanded(null);
+		stopDeferredExpandedLoading();
+	}
+
+	async function confirmDeleteLog() {
+		if (!deleteTargetId) return;
+		setRecordActionBusy(true);
+		setPurgeError(null);
+		setPurgeMessage(null);
+		try {
+			const result = await deleteLogs([deleteTargetId]);
+			collapseIfExpanded(deleteTargetId);
+			setDeleteTargetId(null);
+			setPurgeMessage(`Deleted ${formatNumber(result.deletedLogs)} log record.`);
+			void load();
+		} catch (err) {
+			setPurgeError(err instanceof Error ? err.message : 'Failed to delete log');
+		} finally {
+			setRecordActionBusy(false);
+		}
+	}
+
+	async function confirmStripContent() {
+		if (!stripTargetId) return;
+		setRecordActionBusy(true);
+		setPurgeError(null);
+		setPurgeMessage(null);
+		try {
+			await stripPayload(stripTargetId);
+			collapseIfExpanded(stripTargetId);
+			setStripTargetId(null);
+			setPurgeMessage('Deleted stored prompt and completion content; metadata kept.');
+			void load();
+		} catch (err) {
+			setPurgeError(err instanceof Error ? err.message : 'Failed to delete log content');
+		} finally {
+			setRecordActionBusy(false);
+		}
+	}
+
 	return (
 		<div className="page-stack">
 			<PageHeader
@@ -392,9 +452,8 @@ export function LogsPage() {
 						<div>
 							<h3>Delete old logs</h3>
 							<p>
-								Request logs completed before the selected date are deleted permanently,
-								together with their stored request/response payloads. Feedback entries are
-								kept.
+								Request logs completed before the selected date are deleted permanently, together
+								with their stored request/response payloads. Feedback entries are kept.
 							</p>
 						</div>
 					</div>
@@ -432,6 +491,32 @@ export function LogsPage() {
 				</StatusBanner>
 			) : null}
 			{purgeMessage ? <StatusBanner state="ok" title={purgeMessage} /> : null}
+			{deleteTargetId ? (
+				<ConfirmDialog
+					title="Delete log record?"
+					confirmLabel="Delete record"
+					destructive
+					confirmDisabled={recordActionBusy}
+					onCancel={() => setDeleteTargetId(null)}
+					onConfirm={() => void confirmDeleteLog()}
+				>
+					Delete the record <code>{deleteTargetId}</code> together with its stored prompt and
+					completion? Usage, timing, and cost metadata goes with it. This cannot be undone.
+				</ConfirmDialog>
+			) : null}
+			{stripTargetId ? (
+				<ConfirmDialog
+					title="Delete prompt and completion content?"
+					confirmLabel="Delete content"
+					destructive
+					confirmDisabled={recordActionBusy}
+					onCancel={() => setStripTargetId(null)}
+					onConfirm={() => void confirmStripContent()}
+				>
+					Delete the stored prompt and completion of <code>{stripTargetId}</code>? The record itself
+					stays with its usage, timing, and cost.
+				</ConfirmDialog>
+			) : null}
 			{configDataLoading ? (
 				<StatusBanner state="loading" title="Loading LLM configuration" />
 			) : configDataError ? (
@@ -515,7 +600,19 @@ export function LogsPage() {
 						/>
 						Stream
 					</label>
-					{hasAnalyticsFilters(logFilters) || status || sessionFilter || logIdFilter ? (
+					<label className="toggle-row logs-stream-toggle">
+						<input
+							type="checkbox"
+							checked={includeModelList}
+							onChange={event => setIncludeModelList(event.target.checked)}
+						/>
+						Model list
+					</label>
+					{hasAnalyticsFilters(logFilters) ||
+					status ||
+					sessionFilter ||
+					logIdFilter ||
+					includeModelList ? (
 						<button
 							className="button"
 							type="button"
@@ -526,6 +623,7 @@ export function LogsPage() {
 								setStatus('');
 								setSessionFilter('');
 								setLogIdFilter('');
+								setIncludeModelList(false);
 							}}
 						>
 							Clear filters
@@ -583,6 +681,8 @@ export function LogsPage() {
 									loading={expandedId === entry.id && expandedLoading}
 									onToggle={() => void expand(entry)}
 									onOpenSettings={() => setSettings('logs')}
+									onDelete={setDeleteTargetId}
+									onStripContent={setStripTargetId}
 								/>
 							))}
 						</table>
@@ -1449,6 +1549,10 @@ function LogCallRow(props: {
 	loading: boolean;
 	onToggle: () => void;
 	onOpenSettings?: () => void;
+	/** Delete the record by id; the page shows the confirm dialog. */
+	onDelete?: (id: string) => void;
+	/** Strip the record's payload by id; the page shows the confirm dialog. */
+	onStripContent?: (id: string) => void;
 }) {
 	const originalModel = originalModelForLog(props.entry);
 	const statusBad = Boolean(props.entry.error || (props.entry.httpStatus ?? 0) >= 400);
@@ -1568,6 +1672,10 @@ function LogCallRow(props: {
 								entry={props.detail}
 								promptLoggingEnabled={props.promptLoggingEnabled}
 								onOpenSettings={props.onOpenSettings}
+								onDelete={props.onDelete ? () => props.onDelete?.(props.entry.id) : undefined}
+								onStripContent={
+									props.onStripContent ? () => props.onStripContent?.(props.entry.id) : undefined
+								}
 							/>
 						</div>
 					</td>
@@ -1649,6 +1757,10 @@ function LogDetailView(props: {
 	entry: LogEntry;
 	promptLoggingEnabled: boolean;
 	onOpenSettings?: () => void;
+	/** Delete this record (metadata and payload); page owns the confirm flow. */
+	onDelete?: () => void;
+	/** Drop the stored prompt/completion, keeping this metadata row. */
+	onStripContent?: () => void;
 }) {
 	const messages = logConversation(props.entry);
 	const trajectory = trajectoryEvents(messages);
@@ -1702,10 +1814,24 @@ function LogDetailView(props: {
 						</div>
 					</div>
 				</div>
-				<button className="button" type="button" onClick={() => downloadJson(props.entry)}>
-					<Download size={15} />
-					JSON
-				</button>
+				<div className="button-row">
+					{props.onStripContent && props.entry.hasPayload ? (
+						<button className="button" type="button" onClick={props.onStripContent}>
+							<ShieldEllipsis size={15} />
+							Delete content
+						</button>
+					) : null}
+					{props.onDelete ? (
+						<button className="button danger" type="button" onClick={props.onDelete}>
+							<Trash2 size={15} />
+							Delete
+						</button>
+					) : null}
+					<button className="button" type="button" onClick={() => downloadJson(props.entry)}>
+						<Download size={15} />
+						JSON
+					</button>
+				</div>
 			</div>
 
 			{props.entry.error ? (

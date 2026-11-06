@@ -3671,7 +3671,7 @@ tbody tr:hover {
 .logs-filter-bar {
 	display: flex;
 	flex-wrap: wrap;
-	gap: 12px;
+	gap: 6px;
 	align-items: end;
 }
 
@@ -4266,6 +4266,13 @@ tbody tr:hover {
 
 .logs-filter-bar .field {
 	min-width: 170px;
+	/* The base .field carries margin-bottom: 14px, which lifts labelled inputs
+	   above their flex-end aligned siblings in this bar. */
+	margin-bottom: 0;
+}
+
+.logs-filter-bar input:not([type='checkbox']) {
+	min-height: 40px;
 }
 
 .analytics-controls-right .field {
@@ -6267,7 +6274,7 @@ textarea {
 	}
 
 	.logs-filter-bar {
-		gap: 10px;
+		gap: 6px;
 	}
 
 	.analytics-controls {
@@ -6497,6 +6504,11 @@ textarea {
 }
 
 .session-transcript {
+	margin-top: 16px;
+}
+
+.session-turns {
+	/* The collapsed requests list sits under the transcript; match its spacing. */
 	margin-top: 16px;
 }
 

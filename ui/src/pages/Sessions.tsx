@@ -1,10 +1,15 @@
 import { useNavigate } from '@tanstack/react-router';
-import { ArrowLeft, ChevronRight, MessagesSquare, RefreshCw } from 'lucide-react';
+import { ArrowLeft, ChevronRight, MessagesSquare, RefreshCw, Trash2 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 
-import { getLog, searchLogs, searchSessions } from '@/api/logsApi';
-import { DateRangePicker, type LogTimeRange, logTimeRangeToApi } from '@/components/DateRangePicker';
+import { deleteSession, getLog, searchLogs, searchSessions } from '@/api/logsApi';
 import {
+	DateRangePicker,
+	type LogTimeRange,
+	logTimeRangeToApi
+} from '@/components/DateRangePicker';
+import {
+	ConfirmDialog,
 	EmptyState,
 	FieldGroup,
 	formatDate,
@@ -126,82 +131,91 @@ export function SessionsPage() {
 				</StatusBanner>
 			) : null}
 			{sessionId ? (
-				<SessionDetail session={sessionId} summary={selected} onBack={() => openSession(null)} />
+				<SessionDetail
+					session={sessionId}
+					summary={selected}
+					onBack={() => openSession(null)}
+					onDeleted={() => void load()}
+				/>
 			) : (
-				<Panel className="logs-results-panel">
-					<div className="logs-filter-bar">
-						<FieldGroup label="Session">
-							<input
-								type="text"
-								value={sessionFilter}
-								placeholder="Session id"
-								spellCheck={false}
-								onChange={event => setSessionFilter(event.target.value)}
-							/>
-						</FieldGroup>
-						<FieldGroup label="User">
-							<input
-								type="text"
-								value={userFilter}
-								placeholder="Attributed user id"
-								onChange={event => setUserFilter(event.target.value)}
-							/>
-						</FieldGroup>
-						<DateRangePicker value={timeRange} onChange={setTimeRange} allowAllTime />
-					</div>
-					{sessions.length === 0 && !loading ? (
-						<EmptyState
-							title={hasActiveFilters ? 'No matching sessions' : 'No sessions yet'}
-							description={
-								hasActiveFilters
-									? 'No sessions match the current session, user, and time filters.'
-									: 'Sessions group requests that share a session id header (x-session-id). Ensure request logging is enabled and clients send session ids.'
-							}
-						/>
-					) : sessions.length === 0 ? (
-						<StatusBanner state="loading" title="Loading sessions" />
-					) : (
-						<div className="log-table-wrap">
-							<table className="log-table sessions-table">
-								<thead>
-									<tr>
-										<th>Title</th>
-										<th>Session</th>
-										<th>User</th>
-										<th className="num">Calls</th>
-										<th className="num">Errors</th>
-										<th className="num">Tokens</th>
-										<th className="num">Cost</th>
-										<th>Last activity</th>
-										<th aria-label="Open" />
-									</tr>
-								</thead>
-								<tbody>
-									{sessions.map(session => (
-										<SessionRow
-											key={session.session}
-											session={session}
-											onOpen={() => openSession(session.session)}
-										/>
-									))}
-								</tbody>
-							</table>
-							<div className="log-table-footer">
-								{loading ? 'Refreshing...' : `Showing ${formatNumber(sessions.length)} sessions`}
-								{nextCursor ? (
-									<button
-										className="button"
-										type="button"
-										disabled={loadingMore || loading}
-										onClick={() => void load(nextCursor)}
-									>
-										{loadingMore ? 'Loading...' : 'Load more'}
-									</button>
-								) : null}
-							</div>
+				<>
+					<Panel>
+						<div className="logs-filter-bar">
+							<FieldGroup label="Session">
+								<input
+									type="text"
+									value={sessionFilter}
+									placeholder="Session id"
+									spellCheck={false}
+									onChange={event => setSessionFilter(event.target.value)}
+								/>
+							</FieldGroup>
+							<FieldGroup label="User">
+								<input
+									type="text"
+									value={userFilter}
+									placeholder="Attributed user id"
+									onChange={event => setUserFilter(event.target.value)}
+								/>
+							</FieldGroup>
+							<DateRangePicker value={timeRange} onChange={setTimeRange} allowAllTime />
 						</div>
-					)}
-				</Panel>
+					</Panel>
+					<Panel className="logs-results-panel">
+						{sessions.length === 0 && !loading ? (
+							<EmptyState
+								title={hasActiveFilters ? 'No matching sessions' : 'No sessions yet'}
+								description={
+									hasActiveFilters
+										? 'No sessions match the current session, user, and time filters.'
+										: 'Sessions group requests that share a session id header (x-session-id). Ensure request logging is enabled and clients send session ids.'
+								}
+							/>
+						) : sessions.length === 0 ? (
+							<StatusBanner state="loading" title="Loading sessions" />
+						) : (
+							<div className="log-table-wrap">
+								<table className="log-table sessions-table">
+									<thead>
+										<tr>
+											<th>Title</th>
+											<th>Session</th>
+											<th>User</th>
+											<th className="num">Calls</th>
+											<th className="num">Errors</th>
+											<th className="num">Tokens</th>
+											<th className="num">Cost</th>
+											<th>Last activity</th>
+											<th aria-label="Open" />
+										</tr>
+									</thead>
+									<tbody>
+										{sessions.map(session => (
+											<SessionRow
+												key={session.session}
+												session={session}
+												onOpen={() => openSession(session.session)}
+											/>
+										))}
+									</tbody>
+								</table>
+								<div className="log-table-footer">
+									{loading ? 'Refreshing...' : `Showing ${formatNumber(sessions.length)} sessions`}
+									{nextCursor ? (
+										<button
+											className="button"
+											type="button"
+											disabled={loadingMore || loading}
+											onClick={() => void load(nextCursor)}
+										>
+											{loadingMore ? 'Loading...' : 'Load more'}
+										</button>
+									) : null}
+								</div>
+							</div>
+						)}
+					</Panel>
+				</>
 			)}
 		</div>
 	);
@@ -248,6 +262,8 @@ function SessionDetail(props: {
 	session: string;
 	summary: SessionSummary | null;
 	onBack: () => void;
+	/** Called after the session's logs are deleted, so the list refreshes. */
+	onDeleted: () => void;
 }) {
 	const navigate = useNavigate({ from: '/llm/sessions' });
 	const [turns, setTurns] = useState<LogEntry[]>([]);
@@ -256,6 +272,8 @@ function SessionDetail(props: {
 	const [loading, setLoading] = useState(true);
 	const [loadingOlder, setLoadingOlder] = useState(false);
 	const [error, setError] = useState<string | null>(null);
+	const [confirmDelete, setConfirmDelete] = useState(false);
+	const [deleting, setDeleting] = useState(false);
 	const abortRef = useRef<AbortController | null>(null);
 
 	useEffect(() => {
@@ -334,6 +352,23 @@ function SessionDetail(props: {
 		});
 	}
 
+	async function onDeleteSession() {
+		setDeleting(true);
+		setError(null);
+		try {
+			await deleteSession(props.session);
+			setConfirmDelete(false);
+			props.onBack();
+			props.onDeleted();
+		} catch (err) {
+			if (err instanceof Error) setError(err.message);
+			else setError('Failed to delete session');
+			setConfirmDelete(false);
+		} finally {
+			setDeleting(false);
+		}
+	}
+
 	const messages = transcript ? logConversation(transcript) : [];
 	const trajectory = transcript ? trajectoryEvents(messages) : [];
 
@@ -361,12 +396,36 @@ function SessionDetail(props: {
 						<span>{formatCost(props.summary.cost)}</span>
 					</div>
 				) : null}
-				{turns.length ? (
-					<button className="button" type="button" onClick={openLatestInLogs}>
-						Open latest call in Logs
+				<div className="button-row">
+					{turns.length ? (
+						<button className="button" type="button" onClick={openLatestInLogs}>
+							Open latest call in Logs
+						</button>
+					) : null}
+					<button
+						className="button danger"
+						type="button"
+						disabled={deleting}
+						onClick={() => setConfirmDelete(true)}
+					>
+						<Trash2 size={15} />
+						{deleting ? 'Deleting…' : 'Delete session'}
 					</button>
-				) : null}
+				</div>
 			</div>
+			{confirmDelete ? (
+				<ConfirmDialog
+					title="Delete session logs?"
+					confirmLabel="Delete session"
+					destructive
+					confirmDisabled={deleting}
+					onCancel={() => setConfirmDelete(false)}
+					onConfirm={() => void onDeleteSession()}
+				>
+					Delete every log record of session <code>{props.session}</code>, including stored prompts
+					and completions? Feedback entries are kept. This cannot be undone.
+				</ConfirmDialog>
+			) : null}
 			{loading ? (
 				<StatusBanner state="loading" title="Loading session" />
 			) : error ? (
@@ -375,41 +434,6 @@ function SessionDetail(props: {
 				</StatusBanner>
 			) : (
 				<>
-					<div className="log-table-wrap">
-						<table className="log-table sessions-turns-table">
-							<thead>
-								<tr>
-									<th>Time</th>
-									<th>Model</th>
-									<th>Turn</th>
-									<th className="num">In</th>
-									<th className="num">Out</th>
-									<th className="num">Cost</th>
-									<th className="center">Status</th>
-								</tr>
-							</thead>
-							<tbody>
-								{turns.map(turn => (
-									<TurnRow key={turn.id} entry={turn} />
-								))}
-							</tbody>
-						</table>
-						<div className="log-table-footer">
-							{turns.length
-								? `${formatNumber(turns.length)} calls in this session`
-								: 'No calls found for this session.'}
-							{turnsCursor ? (
-								<button
-									className="button"
-									type="button"
-									disabled={loadingOlder}
-									onClick={() => void loadOlder()}
-								>
-									{loadingOlder ? 'Loading...' : 'Load older calls'}
-								</button>
-							) : null}
-						</div>
-					</div>
 					<section className="session-transcript">
 						<h4>Conversation</h4>
 						{messages.length ? (
@@ -425,10 +449,54 @@ function SessionDetail(props: {
 						) : (
 							<StatusBanner state="info" title="Prompt logging is off">
 								Enable "Include prompts and completions in logs" in log settings to read the
-								conversation here. Per-call metrics above are always available.
+								conversation here. Per-call metrics below are always available.
 							</StatusBanner>
 						)}
 					</section>
+					<details className="log-conversation session-turns">
+						<summary>
+							<ChevronRight className="log-conversation-chevron" size={15} />
+							<span className="log-conversation-title">Requests</span>
+							<span className="log-conversation-count">
+								{turns.length ? `${formatNumber(turns.length)} calls` : 'no calls'}
+							</span>
+						</summary>
+						<div className="log-table-wrap">
+							<table className="log-table sessions-turns-table">
+								<thead>
+									<tr>
+										<th>Time</th>
+										<th>Model</th>
+										<th>Turn</th>
+										<th className="num">In</th>
+										<th className="num">Out</th>
+										<th className="num">Cost</th>
+										<th className="center">Status</th>
+									</tr>
+								</thead>
+								<tbody>
+									{turns.map(turn => (
+										<TurnRow key={turn.id} entry={turn} />
+									))}
+								</tbody>
+							</table>
+							<div className="log-table-footer">
+								{turns.length
+									? `${formatNumber(turns.length)} calls in this session`
+									: 'No calls found for this session.'}
+								{turnsCursor ? (
+									<button
+										className="button"
+										type="button"
+										disabled={loadingOlder}
+										onClick={() => void loadOlder()}
+									>
+										{loadingOlder ? 'Loading...' : 'Load older calls'}
+									</button>
+								) : null}
+							</div>
+						</div>
+					</details>
 				</>
 			)}
 		</Panel>
