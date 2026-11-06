@@ -116,6 +116,9 @@ pub fn router(
 		.route("/api/logs/sessions", post(search_sessions))
 		.route("/api/logs/export", post(export_logs))
 		.route("/api/logs/purge", post(purge_logs))
+		.route("/api/logs/delete", post(delete_logs))
+		.route("/api/logs/delete-session", post(delete_session_logs))
+		.route("/api/logs/strip-payload", post(strip_log_payload))
 		.route("/api/feedback", post(post_feedback))
 		.route("/api/feedback/export", get(export_feedback))
 		.route("/api/logs/analytics/summary", post(analytics_summary))
@@ -1482,6 +1485,68 @@ async fn purge_logs(
 		.map_err(ErrorResponse::Anyhow)
 }
 
+/// Maximum ids accepted per delete call; matches the store's per-batch cap so
+/// one request always lands in a single transaction.
+const MAX_LOG_DELETE_IDS: usize = 500;
+
+/// Delete specific log records by id. Payloads go with their records;
+/// feedback entries are kept.
+async fn delete_logs(
+	State(app): State<App>,
+	Json(request): Json<crate::telemetry::log_store::DeleteLogsRequest>,
+) -> Result<Json<crate::telemetry::log_store::DeleteLogsResponse>, ErrorResponse> {
+	if request.ids.len() > MAX_LOG_DELETE_IDS {
+		return Err(ErrorResponse::Status(
+			StatusCode::BAD_REQUEST,
+			format!(
+				"at most {MAX_LOG_DELETE_IDS} log ids can be deleted per request"
+			),
+		));
+	}
+	app.ensure_writable()?;
+	crate::telemetry::log_store::delete_logs(request)
+		.await
+		.map(Json)
+		.map_err(ErrorResponse::Anyhow)
+}
+
+/// Delete every log record of one session; the session's feedback stays.
+async fn delete_session_logs(
+	State(app): State<App>,
+	Json(request): Json<crate::telemetry::log_store::DeleteSessionRequest>,
+) -> Result<Json<crate::telemetry::log_store::DeleteLogsResponse>, ErrorResponse> {
+	if request.session.trim().is_empty() {
+		return Err(ErrorResponse::Status(
+			StatusCode::BAD_REQUEST,
+			"session must not be empty".to_string(),
+		));
+	}
+	app.ensure_writable()?;
+	crate::telemetry::log_store::delete_session(request)
+		.await
+		.map(Json)
+		.map_err(ErrorResponse::Anyhow)
+}
+
+/// Drop a single log's stored prompt/completion payload, keeping the metadata
+/// row (usage, timing, cost) intact.
+async fn strip_log_payload(
+	State(app): State<App>,
+	Json(request): Json<crate::telemetry::log_store::StripPayloadRequest>,
+) -> Result<Json<crate::telemetry::log_store::DeleteLogsResponse>, ErrorResponse> {
+	if request.id.trim().is_empty() {
+		return Err(ErrorResponse::Status(
+			StatusCode::BAD_REQUEST,
+			"id must not be empty".to_string(),
+		));
+	}
+	app.ensure_writable()?;
+	crate::telemetry::log_store::strip_payload(request)
+		.await
+		.map(Json)
+		.map_err(ErrorResponse::Anyhow)
+}
+
 #[derive(serde::Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LogsExportRequest {
@@ -2325,5 +2390,42 @@ mod tests {
 		)
 		.await;
 		assert_eq!(status, StatusCode::FORBIDDEN);
+	}
+
+	#[tokio::test]
+	async fn targeted_log_deletes_are_blocked_when_read_only() {
+		let app = test_app(true);
+		let router = router(
+			app.state.clone(),
+			app.model_catalog.clone(),
+			None,
+			app.resource_manager.clone(),
+			&EMPTY_ASSETS_DIR,
+		);
+		for (uri, body) in [
+			("/api/logs/delete", r#"{"ids":["0198abc"]}"#),
+			("/api/logs/delete-session", r#"{"session":"session-a"}"#),
+			("/api/logs/strip-payload", r#"{"id":"0198abc"}"#),
+		] {
+			// The read-only rejection must fire before any store is consulted.
+			let (status, _) = post_json(&router, uri, body).await;
+			assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+		}
+	}
+
+	#[tokio::test]
+	async fn log_delete_rejects_oversized_id_lists() {
+		let app = test_app(false);
+		let router = router(
+			app.state.clone(),
+			app.model_catalog.clone(),
+			None,
+			app.resource_manager.clone(),
+			&EMPTY_ASSETS_DIR,
+		);
+		let ids = vec![r#""x""#; 501].join(",");
+		let (status, _) = post_json(&router, "/api/logs/delete", &format!(r#"{{"ids":[{ids}]}}"#))
+			.await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
 	}
 }

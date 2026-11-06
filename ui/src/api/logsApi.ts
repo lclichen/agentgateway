@@ -47,6 +47,30 @@ export function purgeLogs(before: string) {
 	});
 }
 
+/// Delete specific log records by id; their payloads go with them.
+export function deleteLogs(ids: string[]) {
+	return requestJson<{ deletedLogs: number }>('/api/logs/delete', {
+		method: 'POST',
+		body: JSON.stringify({ ids })
+	});
+}
+
+/// Delete every log record of one session (feedback entries are kept).
+export function deleteSession(session: string) {
+	return requestJson<{ deletedLogs: number }>('/api/logs/delete-session', {
+		method: 'POST',
+		body: JSON.stringify({ session })
+	});
+}
+
+/// Drop one log's stored prompt/completion payload, keeping the metadata row.
+export function stripPayload(id: string) {
+	return requestJson<{ deletedLogs: number }>('/api/logs/strip-payload', {
+		method: 'POST',
+		body: JSON.stringify({ id })
+	});
+}
+
 export async function* streamLogs(
 	request: SearchLogsRequest,
 	signal: AbortSignal

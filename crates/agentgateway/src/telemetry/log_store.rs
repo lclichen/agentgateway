@@ -75,6 +75,35 @@ pub struct PurgeResponse {
 	pub deleted_logs: u64,
 }
 
+/// Delete specific log records by id. Payload rows go with their logs;
+/// feedback entries are kept (their `log_id` may dangle, same as purge).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeleteLogsRequest {
+	pub ids: Vec<String>,
+}
+
+/// Delete every log record belonging to one session.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeleteSessionRequest {
+	pub session: String,
+}
+
+/// Drop a single log's stored request/response payload while keeping the
+/// metadata row (usage, timing, cost) intact.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StripPayloadRequest {
+	pub id: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteLogsResponse {
+	pub deleted_logs: u64,
+}
+
 #[derive(Clone)]
 pub struct RequestLogStore {
 	tx: Sender<LogStoreMsg>,
@@ -252,6 +281,33 @@ pub async fn purge(request: PurgeRequest) -> anyhow::Result<PurgeResponse> {
 		.await
 }
 
+pub async fn delete_logs(request: DeleteLogsRequest) -> anyhow::Result<DeleteLogsResponse> {
+	let store = REQUEST_LOG_STORE
+		.get()
+		.ok_or_else(|| anyhow::anyhow!("request log database is not configured"))?;
+	store
+		.request(|tx| LogStoreMsg::DeleteLogs { request, tx })
+		.await
+}
+
+pub async fn delete_session(request: DeleteSessionRequest) -> anyhow::Result<DeleteLogsResponse> {
+	let store = REQUEST_LOG_STORE
+		.get()
+		.ok_or_else(|| anyhow::anyhow!("request log database is not configured"))?;
+	store
+		.request(|tx| LogStoreMsg::DeleteSession { request, tx })
+		.await
+}
+
+pub async fn strip_payload(request: StripPayloadRequest) -> anyhow::Result<DeleteLogsResponse> {
+	let store = REQUEST_LOG_STORE
+		.get()
+		.ok_or_else(|| anyhow::anyhow!("request log database is not configured"))?;
+	store
+		.request(|tx| LogStoreMsg::StripPayload { request, tx })
+		.await
+}
+
 pub struct RequestLogStoreGuard {
 	tx: Sender<LogStoreMsg>,
 	writer: Option<thread::JoinHandle<()>>,
@@ -325,6 +381,18 @@ enum LogStoreMsg {
 	Purge {
 		request: PurgeRequest,
 		tx: QueryResponse<PurgeResponse>,
+	},
+	DeleteLogs {
+		request: DeleteLogsRequest,
+		tx: QueryResponse<DeleteLogsResponse>,
+	},
+	DeleteSession {
+		request: DeleteSessionRequest,
+		tx: QueryResponse<DeleteLogsResponse>,
+	},
+	StripPayload {
+		request: StripPayloadRequest,
+		tx: QueryResponse<DeleteLogsResponse>,
 	},
 	Shutdown,
 }
@@ -539,6 +607,21 @@ async fn process_log_store_msg(
 			let _ = tx.send(backend.purge(request).await);
 			false
 		},
+		LogStoreMsg::DeleteLogs { request, tx } => {
+			flush_log_store_batch(backend, batch).await;
+			let _ = tx.send(backend.delete_logs(&request).await);
+			false
+		},
+		LogStoreMsg::DeleteSession { request, tx } => {
+			flush_log_store_batch(backend, batch).await;
+			let _ = tx.send(backend.delete_session(&request).await);
+			false
+		},
+		LogStoreMsg::StripPayload { request, tx } => {
+			flush_log_store_batch(backend, batch).await;
+			let _ = tx.send(backend.strip_payload(&request).await);
+			false
+		},
 		LogStoreMsg::Shutdown => true,
 	}
 }
@@ -645,10 +728,23 @@ pub struct LogFilters {
 	/// Request log id prefix match, for jumping straight to a known request.
 	#[serde(default)]
 	pub log_id: Option<String>,
+	/// Include model-list requests (`/v1/models` and `/models` polling) in the
+	/// results. They are excluded by default: client model polling otherwise
+	/// floods search results, analytics, and session aggregates with
+	/// operation-less rows. Applies to search, tail, analytics, and session
+	/// member filters alike.
+	#[serde(default)]
+	pub include_model_list: Option<bool>,
 	#[serde(default)]
 	pub has_payload: Option<bool>,
 	#[serde(default)]
 	pub attributes: BTreeMap<String, Value>,
+}
+
+/// Whether model-list request rows pass this filter; excluded unless the
+/// caller explicitly opts in.
+pub(crate) fn include_model_list(filters: &LogFilters) -> bool {
+	filters.include_model_list == Some(true)
 }
 
 /// Trimmed non-empty log id prefix, if any.
@@ -1349,6 +1445,33 @@ impl Backend {
 		match self {
 			Self::Sqlite(store) => store.purge(request).await,
 			Self::Postgres(store) => store.purge(request).await,
+		}
+	}
+
+	async fn delete_logs(&self, request: &DeleteLogsRequest) -> anyhow::Result<DeleteLogsResponse> {
+		match self {
+			Self::Sqlite(store) => store.delete_logs(request).await,
+			Self::Postgres(store) => store.delete_logs(request).await,
+		}
+	}
+
+	async fn delete_session(
+		&self,
+		request: &DeleteSessionRequest,
+	) -> anyhow::Result<DeleteLogsResponse> {
+		match self {
+			Self::Sqlite(store) => store.delete_session(request).await,
+			Self::Postgres(store) => store.delete_session(request).await,
+		}
+	}
+
+	async fn strip_payload(
+		&self,
+		request: &StripPayloadRequest,
+	) -> anyhow::Result<DeleteLogsResponse> {
+		match self {
+			Self::Sqlite(store) => store.strip_payload(request).await,
+			Self::Postgres(store) => store.strip_payload(request).await,
 		}
 	}
 }

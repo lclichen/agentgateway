@@ -15,7 +15,7 @@ use super::{
 	PayloadEntry, SearchRequest, SearchResponse, SessionSummary, SessionsRequest, SessionsResponse,
 	StoredRequestLog, StoredRequestLogPayload, TTFT_BOUNDS_MS, TailRequest, TailResponse,
 	TimeRange, TurnEntry, UsageEntry, analytics_window, attr_filter_values, decode_cursor,
-	encode_cursor, groups_from_buckets, histogram_bucket_sql, like_prefix, limit, log_id_prefix,
+	encode_cursor, groups_from_buckets, histogram_bucket_sql, include_model_list, like_prefix, limit, log_id_prefix,
 	promoted_attribute_column, prompt_preview, truncate_snippet, turn_kind,
 };
 
@@ -476,6 +476,104 @@ impl PostgresLogStore {
 		}
 		Ok(super::PurgeResponse { deleted_logs })
 	}
+
+	/// Delete specific records by id; payloads first for symmetry with sqlite
+	/// (the cascade would handle it here, but the explicit delete documents
+	/// the invariant and keeps both backends identical).
+	pub async fn delete_logs(
+		&self,
+		request: &super::DeleteLogsRequest,
+	) -> anyhow::Result<super::DeleteLogsResponse> {
+		if request.ids.is_empty() {
+			return Ok(super::DeleteLogsResponse { deleted_logs: 0 });
+		}
+		let mut tx = self.pool.begin().await?;
+		for chunk in request.ids.chunks(PURGE_BATCH_SIZE as usize) {
+			let mut payloads = sqlx::QueryBuilder::<Postgres>::new(
+				"DELETE FROM request_log_payloads WHERE log_id IN (",
+			);
+			payloads.push_bind(chunk[0].clone());
+			for id in &chunk[1..] {
+				payloads.push(", ");
+				payloads.push_bind(id.clone());
+			}
+			payloads.push(")");
+			payloads.build().execute(&mut *tx).await?;
+		}
+		let mut removed = 0u64;
+		for chunk in request.ids.chunks(PURGE_BATCH_SIZE as usize) {
+			let mut logs =
+				sqlx::QueryBuilder::<Postgres>::new("DELETE FROM request_logs WHERE id IN (");
+			logs.push_bind(chunk[0].clone());
+			for id in &chunk[1..] {
+				logs.push(", ");
+				logs.push_bind(id.clone());
+			}
+			logs.push(")");
+			removed += logs.build().execute(&mut *tx).await?.rows_affected();
+		}
+		tx.commit().await?;
+		Ok(super::DeleteLogsResponse { deleted_logs: removed })
+	}
+
+	/// Delete every record of one session, batched like purge.
+	pub async fn delete_session(
+		&self,
+		request: &super::DeleteSessionRequest,
+	) -> anyhow::Result<super::DeleteLogsResponse> {
+		let mut deleted_logs = 0u64;
+		loop {
+			let mut tx = self.pool.begin().await?;
+			sqlx::query(
+				"DELETE FROM request_log_payloads WHERE log_id IN (\
+				 SELECT id FROM request_logs WHERE agentgateway_session = $1 ORDER BY id LIMIT $2)",
+			)
+			.bind(&request.session)
+			.bind(PURGE_BATCH_SIZE)
+			.execute(&mut *tx)
+			.await?;
+			let removed = sqlx::query(
+				"DELETE FROM request_logs WHERE id IN (\
+				 SELECT id FROM request_logs WHERE agentgateway_session = $1 ORDER BY id LIMIT $2)",
+			)
+			.bind(&request.session)
+			.bind(PURGE_BATCH_SIZE)
+			.execute(&mut *tx)
+			.await?
+			.rows_affected();
+			tx.commit().await?;
+			if removed == 0 {
+				break;
+			}
+			deleted_logs += removed;
+		}
+		Ok(super::DeleteLogsResponse { deleted_logs })
+	}
+
+	/// Drop one record's payload while keeping its metadata row; the
+	/// `has_payload` flag flips in the same transaction to keep the UI badge
+	/// and the has_payload filter in sync.
+	pub async fn strip_payload(
+		&self,
+		request: &super::StripPayloadRequest,
+	) -> anyhow::Result<super::DeleteLogsResponse> {
+		let mut tx = self.pool.begin().await?;
+		sqlx::query("DELETE FROM request_log_payloads WHERE log_id = $1")
+			.bind(&request.id)
+			.execute(&mut *tx)
+			.await?;
+		let updated = sqlx::query(
+			"UPDATE request_logs SET has_payload = FALSE WHERE id = $1 AND has_payload = TRUE",
+		)
+		.bind(&request.id)
+		.execute(&mut *tx)
+		.await?
+		.rows_affected();
+		tx.commit().await?;
+		Ok(super::DeleteLogsResponse {
+			deleted_logs: updated,
+		})
+	}
 }
 
 async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
@@ -672,6 +770,15 @@ fn push_filters(
 		qb.push(" AND id LIKE ");
 		qb.push_bind(like_prefix(prefix));
 		qb.push(" ESCAPE '\\'");
+	}
+	if !include_model_list(filters) {
+		// Rows without an http.path must stay visible: NOT (NULL LIKE …) is
+		// NULL in SQL, which would otherwise filter them out too.
+		qb.push(
+			" AND (attributes_json ->> 'http.path' IS NULL \
+			   OR (attributes_json ->> 'http.path' NOT LIKE '/v1/models%' \
+			   AND attributes_json ->> 'http.path' NOT LIKE '/models%'))",
+		);
 	}
 	if let Some(has_payload) = filters.has_payload {
 		qb.push(" AND has_payload = ");

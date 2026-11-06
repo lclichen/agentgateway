@@ -159,6 +159,8 @@ export interface LogFilters {
 	responseModel?: string[];
 	traceId?: string | null;
 	logId?: string | null;
+	/** Include /v1/models polling rows; they are hidden server-side by default. */
+	includeModelList?: boolean | null;
 	hasPayload?: boolean | null;
 	attributes?: Record<string, unknown>;
 }

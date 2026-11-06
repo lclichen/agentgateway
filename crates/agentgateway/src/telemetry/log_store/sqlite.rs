@@ -11,7 +11,7 @@ use super::{
 	PayloadEntry, SearchRequest, SearchResponse, SessionSummary, SessionsRequest, SessionsResponse,
 	StoredRequestLog, StoredRequestLogPayload, TTFT_BOUNDS_MS, TailRequest, TailResponse,
 	TimeRange, TurnEntry, UsageEntry, analytics_window, attr_filter_values, decode_cursor,
-	encode_cursor, groups_from_buckets, histogram_bucket_sql, like_prefix, limit, log_id_prefix,
+	encode_cursor, groups_from_buckets, histogram_bucket_sql, include_model_list, like_prefix, limit, log_id_prefix,
 	promoted_attribute_column, prompt_preview, truncate_snippet, turn_kind,
 };
 
@@ -596,6 +596,103 @@ impl SqliteLogStore {
 		}
 		Ok(super::PurgeResponse { deleted_logs })
 	}
+
+	/// Delete specific records by id. Payloads go first explicitly — SQLite FK
+	/// enforcement is pragma-dependent, so never rely on the declared cascade.
+	pub async fn delete_logs(
+		&self,
+		request: &super::DeleteLogsRequest,
+	) -> anyhow::Result<super::DeleteLogsResponse> {
+		if request.ids.is_empty() {
+			return Ok(super::DeleteLogsResponse { deleted_logs: 0 });
+		}
+		let mut tx = self.pool.begin().await?;
+		for chunk in request.ids.chunks(PURGE_BATCH_SIZE as usize) {
+			let mut payloads = sqlx::QueryBuilder::<Sqlite>::new(
+				"DELETE FROM request_log_payloads WHERE log_id IN (",
+			);
+			payloads.push_bind(chunk[0].clone());
+			for id in &chunk[1..] {
+				payloads.push(", ");
+				payloads.push_bind(id.clone());
+			}
+			payloads.push(")");
+			payloads.build().execute(&mut *tx).await?;
+		}
+		let mut removed = 0u64;
+		for chunk in request.ids.chunks(PURGE_BATCH_SIZE as usize) {
+			let mut logs = sqlx::QueryBuilder::<Sqlite>::new("DELETE FROM request_logs WHERE id IN (");
+			logs.push_bind(chunk[0].clone());
+			for id in &chunk[1..] {
+				logs.push(", ");
+				logs.push_bind(id.clone());
+			}
+			logs.push(")");
+			removed += logs.build().execute(&mut *tx).await?.rows_affected();
+		}
+		tx.commit().await?;
+		Ok(super::DeleteLogsResponse { deleted_logs: removed })
+	}
+
+	/// Delete every record of one session, batched like purge so long sessions
+	/// cannot hold the write lock across the whole table.
+	pub async fn delete_session(
+		&self,
+		request: &super::DeleteSessionRequest,
+	) -> anyhow::Result<super::DeleteLogsResponse> {
+		let mut deleted_logs = 0u64;
+		loop {
+			let mut tx = self.pool.begin().await?;
+			sqlx::query(
+				"DELETE FROM request_log_payloads WHERE log_id IN (\
+				 SELECT id FROM request_logs WHERE agentgateway_session = ? ORDER BY id LIMIT ?)",
+			)
+			.bind(&request.session)
+			.bind(PURGE_BATCH_SIZE)
+			.execute(&mut *tx)
+			.await?;
+			let removed = sqlx::query(
+				"DELETE FROM request_logs WHERE id IN (\
+				 SELECT id FROM request_logs WHERE agentgateway_session = ? ORDER BY id LIMIT ?)",
+			)
+			.bind(&request.session)
+			.bind(PURGE_BATCH_SIZE)
+			.execute(&mut *tx)
+			.await?
+			.rows_affected();
+			tx.commit().await?;
+			if removed == 0 {
+				break;
+			}
+			deleted_logs += removed;
+		}
+		Ok(super::DeleteLogsResponse { deleted_logs })
+	}
+
+	/// Drop one record's payload while keeping its metadata row; the
+	/// `has_payload` flag must flip in the same transaction or the UI badge,
+	/// the has_payload filter, and the session transcript picker desync.
+	pub async fn strip_payload(
+		&self,
+		request: &super::StripPayloadRequest,
+	) -> anyhow::Result<super::DeleteLogsResponse> {
+		let mut tx = self.pool.begin().await?;
+		sqlx::query("DELETE FROM request_log_payloads WHERE log_id = ?")
+			.bind(&request.id)
+			.execute(&mut *tx)
+			.await?;
+		let updated = sqlx::query(
+			"UPDATE request_logs SET has_payload = 0 WHERE id = ? AND has_payload = 1",
+		)
+		.bind(&request.id)
+		.execute(&mut *tx)
+		.await?
+		.rows_affected();
+		tx.commit().await?;
+		Ok(super::DeleteLogsResponse {
+			deleted_logs: updated,
+		})
+	}
 }
 
 fn analytics_filter_option_map() -> std::collections::BTreeMap<String, Vec<String>> {
@@ -665,6 +762,19 @@ fn push_filters(
 		qb.push(" AND id LIKE ");
 		qb.push_bind(like_prefix(prefix));
 		qb.push(" ESCAPE '\\'");
+	}
+	if !include_model_list(filters) {
+		// The attribute key contains a dot, so the JSON path must quote it
+		// (push_attr_extract_query); `$.http.path` would read nested members.
+		// Rows without an http.path must stay visible: NOT (NULL LIKE …) is
+		// NULL in SQL, which would otherwise filter them out too.
+		qb.push(" AND (");
+		push_attr_extract_query(qb, "http.path");
+		qb.push(" IS NULL OR (");
+		push_attr_extract_query(qb, "http.path");
+		qb.push(" NOT LIKE '/v1/models%' AND ");
+		push_attr_extract_query(qb, "http.path");
+		qb.push(" NOT LIKE '/models%'))");
 	}
 	if let Some(has_payload) = filters.has_payload {
 		qb.push(" AND has_payload = ");
@@ -903,7 +1013,9 @@ mod tests {
 	use sqlx::sqlite::SqlitePoolOptions;
 
 	use super::*;
-	use crate::telemetry::log_store::PurgeRequest;
+	use crate::telemetry::log_store::{
+		DeleteLogsRequest, DeleteSessionRequest, PurgeRequest, StripPayloadRequest,
+	};
 
 	#[tokio::test]
 	async fn analytics_totals_from_migrated_and_new_rows() -> anyhow::Result<()> {
@@ -1160,6 +1272,210 @@ INSERT INTO request_logs VALUES (
 			.await
 			.unwrap();
 		assert_eq!(response.deleted_logs, 1200);
+	}
+
+	#[tokio::test]
+	async fn delete_logs_removes_rows_and_payloads() {
+		let store = SqliteLogStore::from_pool(memory_pool().await)
+			.await
+			.unwrap();
+		let base = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap();
+		store
+			.insert_batch(&[
+				sample("del-payload", Some("session-a"), base, Some(prompt_payload("secret"))),
+				sample("del-plain", Some("session-a"), base, None),
+				sample("keep-me", Some("session-b"), base, None),
+			])
+			.await
+			.unwrap();
+
+		let response = store
+			.delete_logs(&DeleteLogsRequest {
+				ids: vec!["del-payload".to_string(), "del-plain".to_string()],
+			})
+			.await
+			.unwrap();
+		assert_eq!(response.deleted_logs, 2);
+
+		let gone = store
+			.get(GetRequest {
+				id: "del-payload".to_string(),
+				include_payload: true,
+			})
+			.await
+			.unwrap();
+		assert!(gone.log.is_none(), "deleted row is gone with its payload");
+
+		let remaining = store
+			.search(SearchRequest {
+				limit: Some(10),
+				cursor: None,
+				time_range: None,
+				filters: LogFilters::default(),
+				include_attributes: false,
+				include_payload: false,
+			})
+			.await
+			.unwrap();
+		assert_eq!(remaining.logs.len(), 1);
+		assert_eq!(remaining.logs[0].id, "keep-me");
+
+		// Unknown ids count zero; empty id lists are a no-op.
+		let response = store
+			.delete_logs(&DeleteLogsRequest {
+				ids: vec!["missing".to_string()],
+			})
+			.await
+			.unwrap();
+		assert_eq!(response.deleted_logs, 0);
+		let response = store
+			.delete_logs(&DeleteLogsRequest { ids: vec![] })
+			.await
+			.unwrap();
+		assert_eq!(response.deleted_logs, 0);
+	}
+
+	#[tokio::test]
+	async fn delete_session_removes_only_that_session() {
+		let store = SqliteLogStore::from_pool(memory_pool().await)
+			.await
+			.unwrap();
+		let base = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap();
+		store
+			.insert_batch(&[
+				sample("s1-a", Some("session-1"), base, Some(prompt_payload("a"))),
+				sample("s1-b", Some("session-1"), base, None),
+				sample("s2-a", Some("session-2"), base, None),
+			])
+			.await
+			.unwrap();
+
+		let response = store
+			.delete_session(&DeleteSessionRequest {
+				session: "session-1".to_string(),
+			})
+			.await
+			.unwrap();
+		assert_eq!(response.deleted_logs, 2);
+
+		let remaining = store
+			.search(SearchRequest {
+				limit: Some(10),
+				cursor: None,
+				time_range: None,
+				filters: LogFilters::default(),
+				include_attributes: false,
+				include_payload: true,
+			})
+			.await
+			.unwrap();
+		assert_eq!(remaining.logs.len(), 1);
+		assert_eq!(remaining.logs[0].id, "s2-a");
+
+		// A second sweep is a no-op.
+		let response = store
+			.delete_session(&DeleteSessionRequest {
+				session: "session-1".to_string(),
+			})
+			.await
+			.unwrap();
+		assert_eq!(response.deleted_logs, 0);
+	}
+
+	#[tokio::test]
+	async fn strip_payload_keeps_metadata_and_flips_flag() {
+		let store = SqliteLogStore::from_pool(memory_pool().await)
+			.await
+			.unwrap();
+		let base = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap();
+		store
+			.insert_batch(&[sample(
+				"strip-me",
+				Some("session-a"),
+				base,
+				Some(prompt_payload("sensitive prompt")),
+			)])
+			.await
+			.unwrap();
+
+		let response = store
+			.strip_payload(&StripPayloadRequest {
+				id: "strip-me".to_string(),
+			})
+			.await
+			.unwrap();
+		assert_eq!(response.deleted_logs, 1);
+
+		let kept = store
+			.get(GetRequest {
+				id: "strip-me".to_string(),
+				include_payload: true,
+			})
+			.await
+			.unwrap();
+		let kept = kept.log.expect("metadata row survives the strip");
+		assert!(kept.payload.is_none(), "payload is gone");
+		assert!(!kept.has_payload, "flag flips with the payload");
+
+		// Stripping again finds nothing to do.
+		let response = store
+			.strip_payload(&StripPayloadRequest {
+				id: "strip-me".to_string(),
+			})
+			.await
+			.unwrap();
+		assert_eq!(response.deleted_logs, 0);
+	}
+
+	#[tokio::test]
+	async fn search_hides_model_list_requests_by_default() {
+		let store = SqliteLogStore::from_pool(memory_pool().await)
+			.await
+			.unwrap();
+		let base = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap();
+		let with_path = |id: &str, path: &str| {
+			let mut record = sample(id, None, base, None);
+			record.attributes_json = format!(r#"{{"http.path":"{path}"}}"#).into();
+			record
+		};
+		store
+			.insert_batch(&[
+				with_path("list-models", "/v1/models"),
+				with_path("list-model-by-id", "/v1/models/qwen"),
+				with_path("chat", "/v1/chat/completions"),
+				sample("no-path", None, base, None),
+			])
+			.await
+			.unwrap();
+
+		let search = |filters: LogFilters| {
+			store.search(SearchRequest {
+				limit: Some(10),
+				cursor: None,
+				time_range: None,
+				filters,
+				include_attributes: false,
+				include_payload: false,
+			})
+		};
+		let hidden = search(LogFilters::default()).await.unwrap();
+		assert_eq!(
+			hidden
+				.logs
+				.iter()
+				.map(|log| log.id.as_str())
+				.collect::<Vec<_>>(),
+			vec!["no-path", "chat"],
+			"model-list rows hide unless opted in; pathless rows always show"
+		);
+
+		let shown = search(LogFilters {
+			include_model_list: Some(true),
+			..Default::default()
+		})
+		.await
+		.unwrap();
+		assert_eq!(shown.logs.len(), 4, "opting in returns everything");
 	}
 
 	#[tokio::test]
